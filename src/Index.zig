@@ -215,7 +215,7 @@ pub fn open(gpa: Allocator, io: Io, db_path: [:0]const u8) !*Index {
         error.DatabaseCorrupt => try self.recover(db_path),
         else => |e| return e,
     };
-    self.logf("info", "opened index with {d} entries", .{self.fileCount()});
+    self.logf("info", "opened index with {d} entries (SQLite {s})", .{ self.fileCount(), sqlite.version() });
     return self;
 }
 
@@ -2109,7 +2109,7 @@ test "the log sits next to the database and records opens, scans and failures" {
 
     const text = try readLog(&fx);
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.indexOf(u8, text, " info opened index with 0 entries\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, " info opened index with 0 entries (SQLite ") != null);
     try testing.expect(std.mem.indexOf(u8, text, " info scanned ") != null);
     try testing.expect(std.mem.indexOf(u8, text, " error add folder: FileNotFound\n") != null);
     // "2026-10-15T01:02:03Z level ..." — a UTC timestamp leads every line.

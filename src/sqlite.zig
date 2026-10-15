@@ -28,10 +28,21 @@ extern "c" fn sqlite3_bind_int64(stmt: *c_stmt, idx: c_int, v: i64) c_int;
 extern "c" fn sqlite3_column_int64(stmt: *c_stmt, col: c_int) i64;
 extern "c" fn sqlite3_column_text(stmt: *c_stmt, col: c_int) ?[*]const u8;
 extern "c" fn sqlite3_column_bytes(stmt: *c_stmt, col: c_int) c_int;
+extern "c" fn sqlite3_libversion() [*:0]const u8;
+extern "c" fn sqlite3_libversion_number() c_int;
 extern "c" fn sqlite3_errmsg(db: *c_db) [*:0]const u8;
 
 /// `DatabaseCorrupt` means the file is damaged or isn't a database at all (SQLITE_CORRUPT,
 /// SQLITE_NOTADB); every other failure is `SqliteError`.
+/// The linked SQLite's version, e.g. "3.50.2". Seek bundles SQLite (vendor/sqlite).
+pub fn version() []const u8 {
+    return std.mem.span(sqlite3_libversion());
+}
+
+pub fn versionNumber() c_int {
+    return sqlite3_libversion_number();
+}
+
 pub const Error = error{ SqliteError, DatabaseCorrupt };
 
 fn check(rc: c_int) Error!void {
@@ -218,4 +229,34 @@ test "a file that isn't a database reports DatabaseCorrupt" {
 
 test "opening an unreachable path fails" {
     try std.testing.expectError(error.SqliteError, Db.open("/nonexistent-dir-for-seek-tests/x.db"));
+}
+
+test "the bundled SQLite has what content search needs" {
+    // contentless_delete arrived in 3.43.0; this is the reason SQLite is vendored.
+    try std.testing.expect(versionNumber() >= 3_043_000);
+    try std.testing.expect(std.mem.startsWith(u8, version(), "3."));
+
+    const db = try Db.open(":memory:");
+    defer db.close();
+    try db.exec("CREATE VIRTUAL TABLE t USING fts5(body, content='', contentless_delete=1, tokenize='unicode61 remove_diacritics 2')");
+    try db.exec("INSERT INTO t(rowid, body) VALUES(1, 'Crème brûlée'), (2, 'second document')");
+    try db.exec("DELETE FROM t WHERE rowid = 2");
+    const st = try db.prepare("SELECT rowid FROM t WHERE t MATCH 'creme' ORDER BY bm25(t)");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 1), st.int(0));
+    try std.testing.expect(!try st.step());
+    try db.exec("CREATE VIRTUAL TABLE tri USING fts5(body, tokenize='trigram')");
+}
+
+test "load_extension is compiled out" {
+    const db = try Db.open(":memory:");
+    defer db.close();
+    try std.testing.expectError(error.SqliteError, db.exec("SELECT load_extension('nothing')"));
+}
+
+test "double-quoted strings are not accepted" {
+    const db = try Db.open(":memory:");
+    defer db.close();
+    try std.testing.expectError(error.SqliteError, db.exec("SELECT \"not_a_column\""));
 }

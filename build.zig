@@ -26,6 +26,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     const lib = b.addLibrary(.{ .name = "seek", .linkage = .static, .root_module = lib_mod });
+    addSqlite(b, lib_mod);
     lib.bundle_compiler_rt = true;
     lib.installHeader(b.path("include/seek.h"), "seek.h");
     b.installArtifact(lib);
@@ -37,7 +38,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    exe_mod.linkSystemLibrary("sqlite3", .{});
+    addSqlite(b, exe_mod);
     const exe = b.addExecutable(.{ .name = "seek", .root_module = exe_mod });
     b.installArtifact(exe);
 
@@ -73,23 +74,21 @@ pub fn build(b: *std.Build) void {
         // "built for newer macOS version" warnings.
         var app_query = target.query;
         app_query.os_version_min = .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } };
-        const app_lib = b.addLibrary(.{
-            .name = "seek",
-            .linkage = .static,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/capi.zig"),
-                .target = b.resolveTargetQuery(app_query),
-                .optimize = optimize,
-                .link_libc = true,
-            }),
+        const app_lib_mod = b.createModule(.{
+            .root_source_file = b.path("src/capi.zig"),
+            .target = b.resolveTargetQuery(app_query),
+            .optimize = optimize,
+            .link_libc = true,
         });
+        addSqlite(b, app_lib_mod);
+        const app_lib = b.addLibrary(.{ .name = "seek", .linkage = .static, .root_module = app_lib_mod });
         app_lib.bundle_compiler_rt = true;
 
         const cc = b.addSystemCommand(&.{
             "xcrun",             "clang",      "-fobjc-arc",                "-fmodules",
             "-O2",               "-Wall",      "-mmacosx-version-min=13.0", "-framework",
             "AppKit",            "-framework", "Carbon",                    "-framework",
-            "ServiceManagement", "-lsqlite3",
+            "ServiceManagement",
         });
         cc.addPrefixedDirectoryArg("-I", b.path("include"));
         cc.addFileArg(b.path("macos/SeekApp.m"));
@@ -159,6 +158,7 @@ fn addTestSuite(b: *std.Build, name: []const u8, target: std.Build.ResolvedTarge
         .link_libc = true,
         .sanitize_thread = if (tsan) true else null,
     });
+    addSqlite(b, lib_mod);
     const lib = b.addLibrary(.{ .name = "seek", .linkage = .static, .root_module = lib_mod });
     lib.bundle_compiler_rt = true;
 
@@ -169,14 +169,13 @@ fn addTestSuite(b: *std.Build, name: []const u8, target: std.Build.ResolvedTarge
         .link_libc = true,
         .sanitize_thread = if (tsan) true else null,
     });
-    test_mod.linkSystemLibrary("sqlite3", .{});
+    addSqlite(b, test_mod);
     const unit = b.addRunArtifact(b.addTest(.{ .root_module = test_mod }));
 
     const ctest_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true, .sanitize_thread = if (tsan) true else null });
     ctest_mod.addCSourceFile(.{ .file = b.path("tests/capi_test.c") });
     ctest_mod.addIncludePath(b.path("include"));
     ctest_mod.linkLibrary(lib);
-    ctest_mod.linkSystemLibrary("sqlite3", .{});
     const ctest = b.addRunArtifact(b.addExecutable(.{ .name = "capi_test", .root_module = ctest_mod }));
     ctest.addDirectoryArg(b.path("src")); // a real folder to index
 
@@ -184,4 +183,27 @@ fn addTestSuite(b: *std.Build, name: []const u8, target: std.Build.ResolvedTarge
     group.dependOn(&unit.step);
     group.dependOn(&ctest.step);
     return group;
+}
+
+/// Compiles the vendored SQLite amalgamation (vendor/sqlite) into `mod`, so Seek
+/// never depends on the SQLite that happens to ship with the OS: FTS5 and contentless_delete
+/// (3.43+) are guaranteed everywhere. Version 3.50.2, unmodified, from the libsqlite3-sys 0.35.0 crate;
+/// sha256 sqlite3.c c9a0b6829b81d5f1b78392181f09744c818117a725667411d517b98149fcd3be.
+fn addSqlite(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/sqlite/sqlite3.c"),
+        .flags = &.{
+            "-DSQLITE_ENABLE_FTS5",
+            "-DSQLITE_THREADSAFE=1",
+            "-DSQLITE_DQS=0", // double quotes are identifiers only; strings use single quotes
+            "-DSQLITE_DEFAULT_MEMSTATUS=0",
+            "-DSQLITE_OMIT_LOAD_EXTENSION", // no dlopen of third-party code: part of staying offline and self-contained
+            "-DSQLITE_OMIT_DEPRECATED",
+            "-DSQLITE_OMIT_SHARED_CACHE",
+            // SQLite is third-party code with its own test suite; our sanitizers are for our code.
+            "-fno-sanitize=undefined",
+            "-fno-sanitize=thread",
+        },
+    });
+    mod.addIncludePath(b.path("vendor/sqlite"));
 }
