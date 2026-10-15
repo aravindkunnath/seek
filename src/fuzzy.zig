@@ -204,3 +204,120 @@ test "findLower" {
     try std.testing.expectEqual(@as(?usize, null), findLower("read", "readme"));
     try std.testing.expectEqual(@as(?usize, 0), findLower("Seek", "seek"));
 }
+
+test "empty and whitespace-only queries are empty" {
+    try std.testing.expect(Query.parse("").isEmpty());
+    try std.testing.expect(Query.parse(" \t\r\n ").isEmpty());
+}
+
+test "tokens beyond max_tokens are ignored" {
+    const q = Query.parse("a b c d e f g h i j");
+    try std.testing.expectEqual(@as(usize, max_tokens), q.len);
+    try std.testing.expectEqualStrings("h", q.token(max_tokens - 1));
+}
+
+test "an oversized query is truncated, not overflowed" {
+    const raw: [2000]u8 = @splat('x');
+    const q = Query.parse(&raw);
+    try std.testing.expectEqual(@as(usize, 1), q.len);
+    try std.testing.expectEqual(@as(usize, 512), q.token(0).len);
+}
+
+test "tokens are lowercased and split on any whitespace" {
+    const q = Query.parse("  Tax\t2024\nPDF ");
+    try std.testing.expectEqual(@as(usize, 3), q.len);
+    try std.testing.expectEqualStrings("tax", q.token(0));
+    try std.testing.expectEqualStrings("2024", q.token(1));
+    try std.testing.expectEqualStrings("pdf", q.token(2));
+}
+
+test "charMask ignores case and is a superset for substrings" {
+    try std.testing.expectEqual(charMask("ABC"), charMask("abc"));
+    try std.testing.expectEqual(@as(u64, 0), charMask(""));
+    const whole = charMask("invoice-2024.pdf");
+    const part = charMask("2024");
+    try std.testing.expectEqual(part, whole & part);
+    // Non-alphanumerics must still set a bit, or a query like "-" could never be rejected.
+    try std.testing.expect(charMask("-") != 0);
+    try std.testing.expect(charMask("\xff") != 0);
+}
+
+test "mask rejection never hides a real match" {
+    const paths = [_][]const u8{ "/a/Report Final.PDF", "/x/y-z_w.tar.gz", "/home/ünï/cødé.zig", "/p/.hidden/file" };
+    const queries = [_][]const u8{ "report", "final pdf", "tar gz", "zig", "hidden", ".", "_w" };
+    for (paths) |path| {
+        const name_off = std.mem.lastIndexOfScalar(u8, path, '/').? + 1;
+        for (queries) |raw| {
+            const q = Query.parse(raw);
+            const with_masks = score(&q, path, name_off, charMask(path), charMask(path[name_off..]), 0, 0);
+            const all_ones = score(&q, path, name_off, std.math.maxInt(u64), std.math.maxInt(u64), 0, 0);
+            // Real masks may only reject entries that the unmasked scorer would reject too.
+            if (with_masks == 0) try std.testing.expectEqual(@as(i32, 0), all_ones);
+        }
+    }
+}
+
+test "subsequence needs in-order characters and at least two" {
+    try std.testing.expectEqual(@as(?i32, null), subsequence("abc", "a"));
+    try std.testing.expectEqual(@as(?i32, null), subsequence("abc", "ca"));
+    try std.testing.expectEqual(@as(?i32, null), subsequence("abc", "abd"));
+    try std.testing.expect(subsequence("abc", "ac") != null);
+}
+
+test "subsequence rewards a start match and penalises gaps" {
+    const tight = subsequence("abcdef", "abc").?;
+    const gappy = subsequence("axbxcx", "abc").?;
+    try std.testing.expect(tight > gappy);
+    const at_start = subsequence("abcd", "ab").?;
+    const later = subsequence("xabcd", "ab").?;
+    try std.testing.expect(at_start > later);
+    // Hops across a word boundary are free: "ar" in "alpha-rho" costs nothing extra.
+    try std.testing.expect(subsequence("alpha-rho", "ar").? >= subsequence("alphaxrho", "ar").?);
+}
+
+test "isBoundary" {
+    for (" -_./([+") |ch| try std.testing.expect(isBoundary(ch));
+    for ("aZ09") |ch| try std.testing.expect(!isBoundary(ch));
+}
+
+test "findLower edge cases" {
+    try std.testing.expectEqual(@as(?usize, 0), findLower("anything", ""));
+    try std.testing.expectEqual(@as(?usize, 0), findLower("", ""));
+    try std.testing.expectEqual(@as(?usize, null), findLower("", "a"));
+    try std.testing.expectEqual(@as(?usize, 0), findLower("abab", "ab")); // first occurrence wins
+    try std.testing.expectEqual(@as(?usize, 2), findLower("aXab", "ab")); // restarts after a partial match
+    try std.testing.expectEqual(@as(?usize, 2), findLower("xxAB", "ab")); // match at the very end
+}
+
+test "word-start match beats mid-word match" {
+    const q = Query.parse("report");
+    const word = testScore(&q, "/d/final-report.pdf", 3);
+    const mid = testScore(&q, "/d/finalreport.pdf", 3);
+    try std.testing.expect(word > mid);
+}
+
+test "hidden paths rank below visible ones" {
+    const q = Query.parse("notes");
+    const visible = testScore(&q, "/a/notes.txt", 3);
+    const hidden = testScore(&q, "/.a/notes.txt", 4);
+    try std.testing.expect(visible > hidden);
+}
+
+test "recently modified files rank higher" {
+    const q = Query.parse("notes");
+    const path = "/a/notes.txt";
+    const now: i64 = 1_000_000_000;
+    const day = 86400;
+    const fresh = score(&q, path, 3, charMask(path), charMask(path[3..]), now - day, now);
+    const mid = score(&q, path, 3, charMask(path), charMask(path[3..]), now - 100 * day, now);
+    const old = score(&q, path, 3, charMask(path), charMask(path[3..]), now - 1000 * day, now);
+    const future = score(&q, path, 3, charMask(path), charMask(path[3..]), now + day, now);
+    try std.testing.expect(fresh > mid and mid > old);
+    try std.testing.expectEqual(old, future); // clock skew gets no bonus
+}
+
+test "score is never negative for a match" {
+    const q = Query.parse("a");
+    const long = "/" ++ @as([400]u8, @splat('d')) ++ "/.a";
+    try std.testing.expect(testScore(&q, long, long.len - 1) >= 1);
+}

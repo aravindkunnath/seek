@@ -10,6 +10,8 @@ const Handle = struct {
     index: *Index,
     results: std.heap.ArenaAllocator,
     hits: [256]Index.Hit = undefined,
+    /// Backing store for seek_last_error; only touched by the thread that calls it.
+    last_error: [Index.error_message_max + 1]u8 = @splat(0),
 };
 
 pub const SeekResult = extern struct {
@@ -40,6 +42,21 @@ export fn seek_open(db_path: ?[*:0]const u8) ?*anyopaque {
     return h;
 }
 
+/// Records `err` for seek_last_error and returns the C API's failure value.
+fn fail2(h: *Handle, what: []const u8, err: anyerror) i64 {
+    h.index.recordError(what, err);
+    return -1;
+}
+
+/// Maps a core result to 0 / -1, recording the failure.
+fn status(h: *Handle, what: []const u8, result: anyerror!void) c_int {
+    result catch |err| {
+        h.index.recordError(what, err);
+        return -1;
+    };
+    return 0;
+}
+
 fn fail(h: *Handle) ?*anyopaque {
     h.threaded.deinit();
     gpa.destroy(h);
@@ -55,25 +72,45 @@ export fn seek_close(p: ?*anyopaque) void {
 }
 
 export fn seek_add_root(p: *anyopaque, path: [*:0]const u8) c_int {
-    handle(p).index.addRoot(std.mem.span(path)) catch return -1;
-    return 0;
+    return status(handle(p), "add folder", handle(p).index.addRoot(std.mem.span(path)));
 }
 
 export fn seek_root_count(p: *anyopaque) u32 {
     const idx = handle(p).index;
-    const list = idx.roots(gpa) catch return 0;
+    const list = idx.roots(gpa) catch |err| {
+        idx.recordError("list folders", err);
+        return 0;
+    };
     defer Index.freeRoots(gpa, list);
     return @intCast(list.len);
 }
 
 export fn seek_index_root(p: *anyopaque, path: [*:0]const u8, progress: ?Index.ProgressFn, ctx: ?*anyopaque) i64 {
-    const n = handle(p).index.indexRoot(std.mem.span(path), progress, ctx) catch return -1;
+    const h = handle(p);
+    const n = h.index.indexRoot(std.mem.span(path), progress, ctx) catch |err| return fail2(h, std.mem.span(path), err);
     return @intCast(n);
 }
 
 export fn seek_reindex_all(p: *anyopaque, progress: ?Index.ProgressFn, ctx: ?*anyopaque) i64 {
-    const n = handle(p).index.reindexAll(progress, ctx) catch return -1;
+    const h = handle(p);
+    const n = h.index.reindexAll(progress, ctx) catch |err| return fail2(h, "rescan", err);
     return @intCast(n);
+}
+
+/// Message for the most recent failure on this handle, "" if none. Valid until the next call to
+/// seek_last_error on the same handle. A failure inside one root of seek_reindex_all is recorded here
+/// even though the call itself succeeds.
+export fn seek_last_error(p: *anyopaque) [*:0]const u8 {
+    const h = handle(p);
+    const msg = h.index.lastError(h.last_error[0 .. h.last_error.len - 1]);
+    h.last_error[msg.len] = 0;
+    return @ptrCast(&h.last_error);
+}
+
+/// Path of the diagnostics log (UTF-8, NUL-terminated), "" if there is none. Valid until seek_close.
+export fn seek_log_path(p: *anyopaque) [*:0]const u8 {
+    const idx = handle(p).index;
+    return if (idx.log_path) |lp| lp.ptr else "";
 }
 
 export fn seek_file_count(p: *anyopaque) u64 {
@@ -106,7 +143,10 @@ export fn seek_search_filtered(p: *anyopaque, query: [*:0]const u8, filter: ?*co
             .modified_after = sf.modified_after,
         };
     }
-    const n = h.index.searchFiltered(h.results.allocator(), std.mem.span(query), f, now, h.hits[0..want]) catch return 0;
+    const n = h.index.searchFiltered(h.results.allocator(), std.mem.span(query), f, now, h.hits[0..want]) catch |err| {
+        h.index.recordError("search", err);
+        return 0;
+    };
     for (h.hits[0..n], 0..) |hit, i| {
         out[i] = .{
             .path = @ptrCast(hit.path.ptr),
@@ -126,7 +166,10 @@ export fn seek_find_same_size(p: *anyopaque, size: u64, out: [*]SeekResult, max:
     if (max <= 0) return 0;
     _ = h.results.reset(.retain_capacity);
     const want: usize = @min(@as(usize, @intCast(max)), h.hits.len);
-    const n = h.index.sameSize(h.results.allocator(), size, h.hits[0..want]) catch return 0;
+    const n = h.index.sameSize(h.results.allocator(), size, h.hits[0..want]) catch |err| {
+        h.index.recordError("find same size", err);
+        return 0;
+    };
     for (h.hits[0..n], 0..) |hit, i| {
         out[i] = .{
             .path = @ptrCast(hit.path.ptr),
@@ -145,7 +188,7 @@ pub const StrFn = *const fn (ctx: ?*anyopaque, s: [*:0]const u8, n: u64) callcon
 /// Calls `cb` once per saved folder with its path and indexed entry count. May wait for a running scan.
 export fn seek_list_roots(p: *anyopaque, cb: StrFn, ctx: ?*anyopaque) void {
     const idx = handle(p).index;
-    const list = idx.roots(gpa) catch return;
+    const list = idx.roots(gpa) catch |err| return idx.recordError("list folders", err);
     defer Index.freeRoots(gpa, list);
     for (list) |r| {
         const z = gpa.dupeSentinel(u8, r, 0) catch continue;
@@ -155,24 +198,22 @@ export fn seek_list_roots(p: *anyopaque, cb: StrFn, ctx: ?*anyopaque) void {
 }
 
 export fn seek_remove_root(p: *anyopaque, path: [*:0]const u8) c_int {
-    handle(p).index.removeRoot(std.mem.span(path)) catch return -1;
-    return 0;
+    return status(handle(p), "remove folder", handle(p).index.removeRoot(std.mem.span(path)));
 }
 
 /// User exclusions: a name or `*` pattern (`*.log`, `build`), or an absolute folder path.
 /// Takes effect on the next scan.
 export fn seek_add_exclude(p: *anyopaque, pattern: [*:0]const u8) c_int {
-    handle(p).index.addExclude(std.mem.span(pattern)) catch return -1;
-    return 0;
+    return status(handle(p), "add exclusion", handle(p).index.addExclude(std.mem.span(pattern)));
 }
 
 export fn seek_remove_exclude(p: *anyopaque, pattern: [*:0]const u8) c_int {
-    handle(p).index.removeExclude(std.mem.span(pattern)) catch return -1;
-    return 0;
+    return status(handle(p), "remove exclusion", handle(p).index.removeExclude(std.mem.span(pattern)));
 }
 
 export fn seek_list_excludes(p: *anyopaque, cb: StrFn, ctx: ?*anyopaque) void {
-    const list = handle(p).index.excludes(gpa) catch return;
+    const idx = handle(p).index;
+    const list = idx.excludes(gpa) catch |err| return idx.recordError("list exclusions", err);
     defer Index.freeRoots(gpa, list);
     for (list) |r| {
         const z = gpa.dupeSentinel(u8, r, 0) catch continue;
@@ -190,7 +231,16 @@ export fn seek_list_default_excludes(cb: StrFn, ctx: ?*anyopaque) void {
     }
 }
 
+test "seek_last_error reports failures and is never null" {
+    const h_ptr = seek_open(":memory:") orelse return error.OpenFailed;
+    defer seek_close(h_ptr);
+    try std.testing.expectEqualStrings("", std.mem.span(seek_last_error(h_ptr)));
+    try std.testing.expectEqual(@as(i64, -1), seek_index_root(h_ptr, "/definitely/not/a/real/folder", null, null));
+    try std.testing.expect(std.mem.startsWith(u8, std.mem.span(seek_last_error(h_ptr)), "/definitely/not/a/real/folder: "));
+}
+
 test {
     _ = Index;
     _ = @import("fuzzy.zig");
+    _ = @import("sqlite.zig");
 }

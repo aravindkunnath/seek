@@ -15,7 +15,7 @@ const usage =
     \\  seek index [DIR...]          scan folders (default: all saved folders)
     \\  seek find QUERY... [-n N] [-l]
     \\  seek roots                   list saved folders
-    \\  seek stats                   index size and database location
+    \\  seek stats                   index size, database and log location
     \\
 ;
 
@@ -111,7 +111,7 @@ pub fn main(init: std.process.Init) !void {
         defer Index.freeRoots(gpa, roots);
         for (roots) |r| try out.print("{s}\n", .{r});
     } else if (std.mem.eql(u8, cmd, "stats")) {
-        try out.print("entries: {d}\ndatabase: {s}\n", .{ idx.fileCount(), db_path });
+        try out.print("entries: {d}\ndatabase: {s}\nlog: {s}\n", .{ idx.fileCount(), db_path, idx.logPath() });
     } else {
         try out.writeAll(usage);
     }

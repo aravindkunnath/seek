@@ -18,6 +18,17 @@ db: sqlite.Db,
 db_mutex: Io.Mutex = .init,
 mem_mutex: Io.Mutex = .init,
 snap: Snapshot = .{},
+err_mutex: Io.Mutex = .init,
+err_buf: [error_message_max]u8 = undefined,
+err_len: usize = 0,
+/// Diagnostics log next to the database (see `logPath`); null when there is no folder for it.
+log_path: ?[:0]u8 = null,
+log_old_path: ?[:0]u8 = null,
+
+/// Longest remembered error message; longer ones are cut.
+pub const error_message_max = 512;
+/// When the log grows past this it is moved to `seek.log.1` (replacing the previous one) and restarted.
+pub const log_max_bytes = 256 * 1024;
 
 /// Directory names that are never descended into or indexed.
 pub const default_excludes = [_][]const u8{
@@ -146,12 +157,83 @@ pub fn open(gpa: Allocator, io: Io, db_path: [:0]const u8) !*Index {
     errdefer db.close();
     try db.exec(schema);
     const self = try gpa.create(Index);
+    errdefer gpa.destroy(self);
     self.* = .{ .gpa = gpa, .io = io, .db = db };
+    errdefer self.freeLogPaths();
+    if (std.fs.path.dirname(db_path)) |dir| {
+        self.log_path = try std.fmt.allocPrintSentinel(gpa, "{s}/seek.log", .{dir}, 0);
+        self.log_old_path = try std.fmt.allocPrintSentinel(gpa, "{s}/seek.log.1", .{dir}, 0);
+    }
     try self.reload();
+    self.logf("info", "opened index with {d} entries", .{self.fileCount()});
     return self;
 }
 
+fn freeLogPaths(self: *Index) void {
+    if (self.log_path) |p| self.gpa.free(p);
+    if (self.log_old_path) |p| self.gpa.free(p);
+}
+
+/// Absolute path of the diagnostics log, or "" when the index has no folder to keep one in
+/// (an in-memory database). The file exists once the index has been opened.
+pub fn logPath(self: *Index) []const u8 {
+    return self.log_path orelse "";
+}
+
+const FILE = std.c.FILE;
+
+/// Appends one line, `<UTC time> <level> <message>`, to the log. Best effort: logging must never
+/// make an operation fail, so problems writing it are ignored. Safe from any thread.
+pub fn logf(self: *Index, level: []const u8, comptime fmt: []const u8, args: anytype) void {
+    var msg_buf: [error_message_max]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, fmt, args) catch &msg_buf; // too long: keep the cut-off text
+    self.err_mutex.lockUncancelable(self.io);
+    defer self.err_mutex.unlock(self.io);
+    self.writeLogLocked(level, msg);
+}
+
+fn writeLogLocked(self: *Index, level: []const u8, msg: []const u8) void {
+    const path = self.log_path orelse return;
+    const io = self.io;
+    if (Io.Dir.cwd().statFile(io, path, .{})) |st| {
+        if (st.size > log_max_bytes) _ = std.c.rename(path.ptr, self.log_old_path.?.ptr);
+    } else |_| {} // not there yet: fopen creates it
+    const f = std.c.fopen(path.ptr, "ab") orelse return;
+    defer _ = std.c.fclose(f);
+    const secs: u64 = @intCast(@max(0, @divTrunc(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s)));
+    const es: std.time.epoch.EpochSeconds = .{ .secs = secs };
+    const yd = es.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    var line_buf: [error_message_max + 64]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "{d}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z {s} {s}\n", .{
+        yd.year,              md.month.numeric(),      md.day_index + 1,
+        ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+        level,                msg,
+    }) catch return;
+    _ = std.c.fwrite(line.ptr, 1, line.len, f);
+}
+
+/// Remembers `what: error` as the most recent failure (see `lastError`). Safe from any thread.
+pub fn recordError(self: *Index, what: []const u8, err: anyerror) void {
+    self.err_mutex.lockUncancelable(self.io);
+    defer self.err_mutex.unlock(self.io);
+    const msg = std.fmt.bufPrint(&self.err_buf, "{s}: {t}", .{ what, err }) catch &self.err_buf; // too long: keep the cut-off text
+    self.err_len = msg.len;
+    self.writeLogLocked("error", msg);
+}
+
+/// Copies the most recent failure message into `out` (cut to fit). Empty when nothing has failed.
+pub fn lastError(self: *Index, out: []u8) []const u8 {
+    self.err_mutex.lockUncancelable(self.io);
+    defer self.err_mutex.unlock(self.io);
+    const n = @min(self.err_len, out.len);
+    @memcpy(out[0..n], self.err_buf[0..n]);
+    return out[0..n];
+}
+
 pub fn close(self: *Index) void {
+    self.freeLogPaths();
     self.snap.deinit(self.gpa);
     self.db.close();
     self.gpa.destroy(self);
@@ -454,15 +536,29 @@ pub fn indexRoot(self: *Index, root_in: []const u8, progress: ?ProgressFn, ctx: 
     if (progress) |cb| cb(ctx, count);
 
     try self.reloadLocked();
+    self.logf("info", "scanned {s}: {d} entries", .{ root, count });
     return count;
 }
 
 /// Re-scans every saved root. Returns the total number of entries seen.
+/// A root that fails (say, an unmounted drive) doesn't stop the others; the failure is
+/// kept for `lastError` and counted in the `failed` out-parameter when given.
 pub fn reindexAll(self: *Index, progress: ?ProgressFn, ctx: ?*anyopaque) !u64 {
+    return self.reindexAllCounting(progress, ctx, null);
+}
+
+pub fn reindexAllCounting(self: *Index, progress: ?ProgressFn, ctx: ?*anyopaque, failed: ?*u32) !u64 {
     const list = try self.roots(self.gpa);
     defer freeRoots(self.gpa, list);
     var total: u64 = 0;
-    for (list) |r| total += self.indexRoot(r, progress, ctx) catch 0;
+    if (failed) |f| f.* = 0;
+    for (list) |r| {
+        total += self.indexRoot(r, progress, ctx) catch |err| {
+            self.recordError(r, err);
+            if (failed) |f| f.* += 1;
+            continue;
+        };
+    }
     return total;
 }
 
@@ -723,4 +819,898 @@ test "removing a root drops its entries" {
     const list = try idx.roots(gpa);
     defer freeRoots(gpa, list);
     try std.testing.expectEqual(@as(usize, 0), list.len);
+}
+
+// ---------------------------------------------------------------- tests
+
+const testing = std.testing;
+
+/// A scratch folder to index plus a scratch database kept outside it, so the database never
+/// shows up in its own results.
+const Fixture = struct {
+    tree: testing.TmpDir,
+    db_dir: testing.TmpDir,
+    root_buf: [std.fs.max_path_bytes]u8 = undefined,
+    root_len: usize = 0,
+    db_buf: [std.fs.max_path_bytes + 16]u8 = undefined,
+    db_len: usize = 0,
+
+    /// Fixtures hold self-referential buffers, so initialise in place: `var fx: Fixture = undefined; try fx.init();`
+    fn init(fx: *Fixture) !void {
+        const io = testing.io;
+        fx.tree = testing.tmpDir(.{ .iterate = true });
+        errdefer fx.tree.cleanup();
+        fx.db_dir = testing.tmpDir(.{});
+        errdefer fx.db_dir.cleanup();
+        fx.root_len = try fx.tree.dir.realPath(io, &fx.root_buf);
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir_len = try fx.db_dir.dir.realPath(io, &dir_buf);
+        fx.db_len = (try std.fmt.bufPrint(&fx.db_buf, "{s}/seek.db", .{dir_buf[0..dir_len]})).len;
+        fx.db_buf[fx.db_len] = 0;
+    }
+
+    fn deinit(fx: *Fixture) void {
+        fx.tree.cleanup();
+        fx.db_dir.cleanup();
+    }
+
+    fn root(fx: *const Fixture) []const u8 {
+        return fx.root_buf[0..fx.root_len];
+    }
+
+    fn dbPath(fx: *const Fixture) [:0]const u8 {
+        return fx.db_buf[0..fx.db_len :0];
+    }
+
+    fn touch(fx: *Fixture, path: []const u8) !void {
+        try fx.write(path, "");
+    }
+
+    fn write(fx: *Fixture, path: []const u8, data: []const u8) !void {
+        if (std.fs.path.dirname(path)) |d| try fx.tree.dir.createDirPath(testing.io, d);
+        try fx.tree.dir.writeFile(testing.io, .{ .sub_path = path, .data = data });
+    }
+
+    fn open(fx: *const Fixture) !*Index {
+        return Index.open(testing.allocator, testing.io, fx.dbPath());
+    }
+};
+
+/// Runs `query` and returns how many hits came back; `hits` holds them, paths owned by `arena`.
+fn run(idx: *Index, arena: Allocator, query: []const u8, filter: Filter, hits: []Hit) !usize {
+    return idx.searchFiltered(arena, query, filter, 0, hits);
+}
+
+fn hasSuffixHit(hits: []const Hit, suffix: []const u8) bool {
+    for (hits) |h| if (std.mem.endsWith(u8, h.path, suffix)) return true;
+    return false;
+}
+
+test "globMatch" {
+    const cases = [_]struct { []const u8, []const u8, bool }{
+        .{ "*.log", "a.log", true },
+        .{ "*.log", "a.logx", false },
+        .{ "*.log", ".log", true },
+        .{ "b*d", "bold", true },
+        .{ "b*d", "bd", true },
+        .{ "b*d", "bo", false },
+        .{ "*", "", true },
+        .{ "*", "anything", true },
+        .{ "**", "anything", true },
+        .{ "a*b*c", "aXXbYYc", true },
+        .{ "a*b*c", "aXXcYYb", false },
+        .{ "a*a*a", "aaa", true },
+        .{ "a*a*a", "aa", false },
+        .{ "build", "build", true },
+        .{ "build", "builds", false },
+        .{ "build", "Build", false }, // case-sensitive, like the shell
+        .{ "", "", true },
+        .{ "", "x", false },
+        .{ "x", "", false },
+        .{ "*x", "", false },
+        .{ "?", "?", true }, // no `?` wildcard: it is literal
+        .{ "?", "a", false },
+    };
+    for (cases) |c| try testing.expectEqual(c[2], globMatch(c[0], c[1]));
+}
+
+test "globMatch does not go exponential on adversarial patterns" {
+    const text: [4000]u8 = @splat('a');
+    try testing.expect(!globMatch("a*a*a*a*a*a*a*a*b", &text));
+    try testing.expect(globMatch("a*a*a*a*a*a*a*a*a", &text));
+}
+
+test "userExcluded matches names by glob and folders by absolute path" {
+    var a = "*.log".*;
+    var b = "/home/u/private".*;
+    const patterns = [_][]u8{ &a, &b };
+    try testing.expect(userExcluded(&patterns, "x.log", "/home/u/docs/x.log"));
+    try testing.expect(userExcluded(&patterns, "private", "/home/u/private"));
+    try testing.expect(!userExcluded(&patterns, "private", "/home/u/docs/private")); // absolute means exact
+    try testing.expect(!userExcluded(&patterns, "private-notes", "/home/u/private-notes"));
+    try testing.expect(!userExcluded(&.{}, "x.log", "/x.log"));
+}
+
+test "trimSlash" {
+    try testing.expectEqualStrings("/a/b", trimSlash("/a/b/"));
+    try testing.expectEqualStrings("/a/b", trimSlash("/a/b"));
+    try testing.expectEqualStrings("/", trimSlash("/"));
+    try testing.expectEqualStrings("", trimSlash(""));
+}
+
+test "extOf" {
+    try testing.expectEqualStrings("pdf", extOf("a.pdf"));
+    try testing.expectEqualStrings("gz", extOf("a.tar.gz"));
+    try testing.expectEqualStrings("", extOf("Makefile"));
+    try testing.expectEqualStrings("", extOf(".bashrc")); // a dotfile has no extension
+    try testing.expectEqualStrings("", extOf("trailing."));
+    try testing.expectEqualStrings("", extOf(""));
+}
+
+test "kindOf classifies by extension, case-insensitively" {
+    try testing.expectEqual(Filter.Kind.documents, kindOf("a.PDF"));
+    try testing.expectEqual(Filter.Kind.images, kindOf("a.JpEg"));
+    try testing.expectEqual(Filter.Kind.audio, kindOf("a.flac"));
+    try testing.expectEqual(Filter.Kind.video, kindOf("a.mkv"));
+    try testing.expectEqual(Filter.Kind.code, kindOf("main.zig"));
+    try testing.expectEqual(Filter.Kind.archives, kindOf("a.tar.gz"));
+    try testing.expectEqual(Filter.Kind.any, kindOf("README"));
+    try testing.expectEqual(Filter.Kind.any, kindOf("a.unknownext"));
+    try testing.expectEqual(Filter.Kind.any, kindOf("trailing."));
+    try testing.expectEqual(Filter.Kind.any, kindOf("a.verylongextension")); // longer than the 8-byte buffer
+}
+
+test "no extension is claimed by two kinds" {
+    for (kind_exts, 0..) |a, i| {
+        for (kind_exts[i + 1 ..]) |b| {
+            for (a[1]) |x| for (b[1]) |y| try testing.expect(!std.mem.eql(u8, x, y));
+        }
+        for (a[1]) |x| {
+            var lower_buf: [8]u8 = undefined;
+            try testing.expect(x.len <= 8); // kindOf can't see longer extensions
+            try testing.expectEqualStrings(x, std.ascii.lowerString(&lower_buf, x)); // table is lowercase
+        }
+    }
+}
+
+test "isExcluded and isPackage" {
+    for (default_excludes) |name| try testing.expect(isExcluded(name));
+    try testing.expect(!isExcluded("src"));
+    try testing.expect(!isExcluded("node_modules2"));
+    try testing.expect(isPackage("Safari.app"));
+    try testing.expect(isPackage("Pics.photoslibrary"));
+    try testing.expect(!isPackage("app"));
+    try testing.expect(!isPackage("application"));
+}
+
+test "default excludes have no duplicates" {
+    for (default_excludes, 0..) |a, i| {
+        for (default_excludes[i + 1 ..]) |b| try testing.expect(!std.mem.eql(u8, a, b));
+    }
+}
+
+test "Filter.isActive is false only for the zero value" {
+    try testing.expect(!(Filter{}).isActive());
+    try testing.expect((Filter{ .scope = .files }).isActive());
+    try testing.expect((Filter{ .kind = .code }).isActive());
+    try testing.expect((Filter{ .min_size = 1 }).isActive());
+    try testing.expect((Filter{ .modified_after = 1 }).isActive());
+}
+
+test "Filter.matches" {
+    const file: Entry = .{ .off = 0, .len = 0, .name_off = 2, .is_dir = false, .size = 100, .mtime = 500, .path_mask = 0, .name_mask = 0 };
+    var dir = file;
+    dir.is_dir = true;
+    dir.size = 0;
+    const path = "/a.pdf";
+
+    try testing.expect((Filter{}).matches(path, file));
+    try testing.expect((Filter{}).matches(path, dir));
+    try testing.expect((Filter{ .scope = .files }).matches(path, file));
+    try testing.expect(!(Filter{ .scope = .files }).matches(path, dir));
+    try testing.expect(!(Filter{ .scope = .folders }).matches(path, file));
+    try testing.expect((Filter{ .scope = .folders }).matches(path, dir));
+
+    try testing.expect((Filter{ .min_size = 100 }).matches(path, file)); // inclusive
+    try testing.expect(!(Filter{ .min_size = 101 }).matches(path, file));
+    try testing.expect(!(Filter{ .min_size = 1 }).matches(path, dir)); // folders have no size
+
+    try testing.expect((Filter{ .modified_after = 500 }).matches(path, file)); // inclusive
+    try testing.expect(!(Filter{ .modified_after = 501 }).matches(path, file));
+
+    try testing.expect((Filter{ .kind = .documents }).matches(path, file));
+    try testing.expect(!(Filter{ .kind = .images }).matches(path, file));
+    try testing.expect(!(Filter{ .kind = .documents }).matches("/a.pdf", dir)); // a folder named like a file
+}
+
+test "TopK keeps the best k, ordered by score then shorter path" {
+    var top: TopK = .{ .k = 3 };
+    top.insert(.{ .idx = 0, .score = 10, .len = 5 });
+    top.insert(.{ .idx = 1, .score = 30, .len = 5 });
+    top.insert(.{ .idx = 2, .score = 20, .len = 5 });
+    top.insert(.{ .idx = 3, .score = 5, .len = 5 }); // too weak: dropped
+    try testing.expectEqual(@as(usize, 3), top.n);
+    try testing.expectEqual(@as(u32, 1), top.buf[0].idx);
+    try testing.expectEqual(@as(u32, 2), top.buf[1].idx);
+    try testing.expectEqual(@as(u32, 0), top.buf[2].idx);
+
+    top.insert(.{ .idx = 4, .score = 20, .len = 2 }); // ties on score: the shorter path wins
+    try testing.expectEqual(@as(u32, 1), top.buf[0].idx);
+    try testing.expectEqual(@as(u32, 4), top.buf[1].idx);
+    try testing.expectEqual(@as(u32, 2), top.buf[2].idx);
+    try testing.expectEqual(@as(usize, 3), top.n);
+
+    top.insert(.{ .idx = 5, .score = 20, .len = 5 }); // exact tie with the last: first come, first kept
+    try testing.expectEqual(@as(u32, 2), top.buf[2].idx);
+}
+
+test "TopK with k = 1 and k = max_hits" {
+    var one: TopK = .{ .k = 1 };
+    for (0..10) |i| one.insert(.{ .idx = @intCast(i), .score = @intCast(i), .len = 1 });
+    try testing.expectEqual(@as(usize, 1), one.n);
+    try testing.expectEqual(@as(u32, 9), one.buf[0].idx);
+
+    var full: TopK = .{ .k = max_hits };
+    for (0..max_hits * 2) |i| full.insert(.{ .idx = @intCast(i), .score = @intCast(i), .len = 1 });
+    try testing.expectEqual(@as(usize, max_hits), full.n);
+    try testing.expectEqual(@as(u32, max_hits * 2 - 1), full.buf[0].idx);
+    for (full.buf[1..full.n], 0..) |r, i| try testing.expect(full.buf[i].score >= r.score);
+}
+
+test "an empty query, an empty output buffer and an empty index all return nothing" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const idx = try fx.open();
+    defer idx.close();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var hits: [4]Hit = undefined;
+
+    try testing.expectEqual(@as(usize, 0), try idx.search(arena.allocator(), "anything", 0, &hits));
+    try fx.touch("a.txt");
+    _ = try idx.indexRoot(fx.root(), null, null);
+    try testing.expectEqual(@as(usize, 0), try idx.search(arena.allocator(), "", 0, &hits));
+    try testing.expectEqual(@as(usize, 0), try idx.search(arena.allocator(), "   ", 0, &hits));
+    try testing.expectEqual(@as(usize, 0), try idx.search(arena.allocator(), "a", 0, hits[0..0]));
+    try testing.expectEqual(@as(usize, 1), try idx.search(arena.allocator(), "a.txt", 0, &hits));
+}
+
+test "results are capped by the output buffer, best first" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.touch("report.txt");
+    try fx.touch("deep/er/old-report-copy.txt");
+    try fx.touch("deep/er/report-draft.txt");
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    var all: [8]Hit = undefined;
+    const n = try idx.search(arena.allocator(), "report", 0, &all);
+    try testing.expectEqual(@as(usize, 3), n);
+    for (all[1..n], 0..) |h, i| try testing.expect(all[i].score >= h.score);
+    try testing.expect(std.mem.endsWith(u8, all[0].path, "/report.txt"));
+
+    var one: [1]Hit = undefined;
+    try testing.expectEqual(@as(usize, 1), try idx.search(arena.allocator(), "report", 0, &one));
+    try testing.expectEqualStrings(all[0].path, one[0].path);
+}
+
+test "hit fields describe the file" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.write("sub/data.bin", "12345");
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    var hits: [4]Hit = undefined;
+    try testing.expectEqual(@as(usize, 1), try idx.search(arena.allocator(), "data.bin", 0, &hits));
+    const h = hits[0];
+    try testing.expectEqual(@as(u64, 5), h.size);
+    try testing.expect(!h.is_dir);
+    try testing.expectEqualStrings("data.bin", h.path[h.name_off..]);
+    try testing.expect(h.mtime > 0);
+    try testing.expect(h.score > 0);
+    try testing.expectEqual(@as(u8, 0), h.path.ptr[h.path.len]); // NUL-terminated for the C API
+
+    try testing.expectEqual(@as(usize, 1), try idx.searchFiltered(arena.allocator(), "sub", .{ .scope = .folders }, 0, &hits));
+    try testing.expect(hits[0].is_dir);
+    try testing.expectEqual(@as(u64, 0), hits[0].size);
+}
+
+test "filters combine" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.write("small.pdf", "x");
+    try fx.write("big.pdf", &@as([2000]u8, @splat('x')));
+    try fx.write("big.png", &@as([2000]u8, @splat('x')));
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var hits: [8]Hit = undefined;
+    const a = arena.allocator();
+
+    try testing.expectEqual(@as(usize, 2), try run(idx, a, "big", .{}, &hits));
+    try testing.expectEqual(@as(usize, 1), try run(idx, a, "big", .{ .kind = .images }, &hits));
+    const n = try run(idx, a, ".", .{ .kind = .documents, .min_size = 1000 }, &hits);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expect(hasSuffixHit(hits[0..n], "big.pdf"));
+    try testing.expectEqual(@as(usize, 0), try run(idx, a, ".", .{ .kind = .documents, .min_size = 5000 }, &hits));
+    try testing.expectEqual(@as(usize, 0), try run(idx, a, ".", .{ .modified_after = std.math.maxInt(i64) }, &hits));
+    try testing.expect(try run(idx, a, ".", .{ .modified_after = 1 }, &hits) >= 3);
+}
+
+test "sameSize finds files of exactly that size and respects the buffer" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.write("a.bin", "1234");
+    try fx.write("d/b.bin", "abcd");
+    try fx.write("c.bin", "123");
+    try fx.tree.dir.createDirPath(testing.io, "dir4");
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var hits: [8]Hit = undefined;
+
+    const n = try idx.sameSize(arena.allocator(), 4, &hits);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expect(hasSuffixHit(hits[0..n], "/a.bin") and hasSuffixHit(hits[0..n], "/b.bin"));
+    for (hits[0..n]) |h| try testing.expectEqual(@as(u64, 4), h.size);
+    try testing.expectEqual(@as(usize, 1), try idx.sameSize(arena.allocator(), 4, hits[0..1]));
+    try testing.expectEqual(@as(usize, 0), try idx.sameSize(arena.allocator(), 4, hits[0..0]));
+    try testing.expectEqual(@as(usize, 0), try idx.sameSize(arena.allocator(), 999, &hits));
+    try testing.expectEqual(@as(usize, 0), try idx.sameSize(arena.allocator(), 0, &hits));
+}
+
+test "the index persists across close and open" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.touch("persisted.txt");
+    {
+        const idx = try fx.open();
+        defer idx.close();
+        try idx.addExclude("*.tmp");
+        _ = try idx.indexRoot(fx.root(), null, null);
+    }
+    const idx = try fx.open();
+    defer idx.close();
+    try testing.expect(idx.fileCount() >= 1);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var hits: [4]Hit = undefined;
+    try testing.expectEqual(@as(usize, 1), try idx.search(arena.allocator(), "persisted", 0, &hits));
+
+    const roots_now = try idx.roots(testing.allocator);
+    defer freeRoots(testing.allocator, roots_now);
+    try testing.expectEqual(@as(usize, 1), roots_now.len);
+    try testing.expectEqualStrings(fx.root(), roots_now[0]);
+    const ex = try idx.excludes(testing.allocator);
+    defer freeRoots(testing.allocator, ex);
+    try testing.expectEqual(@as(usize, 1), ex.len);
+    try testing.expectEqualStrings("*.tmp", ex[0]);
+}
+
+test "roots are deduplicated, sorted and stored without a trailing slash" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const idx = try fx.open();
+    defer idx.close();
+    try idx.addRoot("/zeta/");
+    try idx.addRoot("/zeta");
+    try idx.addRoot("/alpha");
+    const list = try idx.roots(testing.allocator);
+    defer freeRoots(testing.allocator, list);
+    try testing.expectEqual(@as(usize, 2), list.len);
+    try testing.expectEqualStrings("/alpha", list[0]);
+    try testing.expectEqualStrings("/zeta", list[1]);
+}
+
+test "excludes: empty patterns are ignored, absolute ones lose their trailing slash" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const idx = try fx.open();
+    defer idx.close();
+    try idx.addExclude("");
+    try idx.addExclude("/some/dir/");
+    try idx.addExclude("*.log");
+    try idx.addExclude("*.log");
+    {
+        const list = try idx.excludes(testing.allocator);
+        defer freeRoots(testing.allocator, list);
+        try testing.expectEqual(@as(usize, 2), list.len);
+        try testing.expectEqualStrings("*.log", list[0]); // '*' sorts before '/'
+        try testing.expectEqualStrings("/some/dir", list[1]);
+    }
+    try idx.removeExclude("*.log");
+    try idx.removeExclude("never-added"); // not an error
+    const list = try idx.excludes(testing.allocator);
+    defer freeRoots(testing.allocator, list);
+    try testing.expectEqual(@as(usize, 1), list.len);
+}
+
+test "excluding a folder by absolute path skips everything under it" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.touch("keep/a.txt");
+    try fx.touch("secret/b.txt");
+    try fx.touch("secret-not/c.txt");
+    const idx = try fx.open();
+    defer idx.close();
+    const abs = try std.fmt.allocPrint(testing.allocator, "{s}/secret", .{fx.root()});
+    defer testing.allocator.free(abs);
+    try idx.addExclude(abs);
+    _ = try idx.indexRoot(fx.root(), null, null);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var hits: [8]Hit = undefined;
+    try testing.expectEqual(@as(usize, 0), try idx.search(arena.allocator(), "b.txt", 0, &hits));
+    try testing.expectEqual(@as(usize, 1), try idx.search(arena.allocator(), "a.txt", 0, &hits));
+    try testing.expectEqual(@as(usize, 1), try idx.search(arena.allocator(), "c.txt", 0, &hits));
+}
+
+test "default excludes and packages: bundles are one entry, junk folders are absent" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.touch(".git/config");
+    try fx.touch("node_modules/pkg/index.js");
+    try fx.touch("Thing.app/Contents/Info.txt");
+    try fx.touch("visible.txt");
+    const idx = try fx.open();
+    defer idx.close();
+    const n = try idx.indexRoot(fx.root(), null, null);
+    try testing.expectEqual(@as(u64, 2), n); // Thing.app and visible.txt
+    try testing.expectEqual(@as(u64, 2), idx.fileCount());
+}
+
+test "indexRoot reports progress and returns the final count" {
+    const Ctx = struct {
+        calls: u32 = 0,
+        last: u64 = 0,
+        fn cb(ctx: ?*anyopaque, n: u64) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            self.last = n;
+        }
+    };
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    for (0..7) |i| {
+        var name_buf: [16]u8 = undefined;
+        try fx.touch(try std.fmt.bufPrint(&name_buf, "f{d}.txt", .{i}));
+    }
+    const idx = try fx.open();
+    defer idx.close();
+    var ctx: Ctx = .{};
+    const n = try idx.indexRoot(fx.root(), Ctx.cb, &ctx);
+    try testing.expectEqual(@as(u64, 7), n);
+    try testing.expect(ctx.calls >= 1); // at least the final report
+    try testing.expectEqual(@as(u64, 7), ctx.last);
+}
+
+test "indexing a missing folder is an error and leaves the index untouched" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.touch("a.txt");
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+    const before = idx.fileCount();
+    try testing.expect(std.meta.isError(idx.indexRoot("/definitely/not/a/real/folder", null, null)));
+    try testing.expectEqual(before, idx.fileCount());
+    const list = try idx.roots(testing.allocator);
+    defer freeRoots(testing.allocator, list);
+    try testing.expectEqual(@as(usize, 1), list.len); // the bad path was not recorded as a root
+}
+
+test "a trailing slash on the root changes nothing" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.touch("a.txt");
+    const idx = try fx.open();
+    defer idx.close();
+    const slashed = try std.fmt.allocPrint(testing.allocator, "{s}/", .{fx.root()});
+    defer testing.allocator.free(slashed);
+    try testing.expectEqual(@as(u64, 1), try idx.indexRoot(slashed, null, null));
+    try testing.expectEqual(@as(u64, 1), idx.rootFileCount(slashed));
+    try testing.expectEqual(@as(u64, 1), idx.rootFileCount(fx.root()));
+}
+
+test "re-indexing is idempotent and picks up new and changed files" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.write("a.txt", "1");
+    const idx = try fx.open();
+    defer idx.close();
+    try testing.expectEqual(@as(u64, 1), try idx.indexRoot(fx.root(), null, null));
+    try testing.expectEqual(@as(u64, 1), try idx.indexRoot(fx.root(), null, null));
+    try testing.expectEqual(@as(u64, 1), idx.fileCount());
+
+    try fx.write("a.txt", "123456");
+    try fx.touch("b.txt");
+    try testing.expectEqual(@as(u64, 2), try idx.indexRoot(fx.root(), null, null));
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var hits: [4]Hit = undefined;
+    try testing.expectEqual(@as(usize, 1), try idx.search(arena.allocator(), "a.txt", 0, &hits));
+    try testing.expectEqual(@as(u64, 6), hits[0].size);
+}
+
+test "reindexAll rescans every root and skips ones that have vanished" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    var other: Fixture = undefined;
+    try other.init();
+    defer other.deinit();
+    try fx.touch("one.txt");
+    try other.touch("two.txt");
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+    _ = try idx.indexRoot(other.root(), null, null);
+    try testing.expectEqual(@as(u64, 2), try idx.reindexAll(null, null));
+
+    try idx.addRoot("/definitely/not/a/real/folder");
+    try fx.touch("three.txt");
+    try testing.expectEqual(@as(u64, 3), try idx.reindexAll(null, null)); // the dead root contributes 0, not an error
+
+    // ...but the failure is reported rather than swallowed.
+    var failed: u32 = undefined;
+    _ = try idx.reindexAllCounting(null, null, &failed);
+    try testing.expectEqual(@as(u32, 1), failed);
+    var buf: [error_message_max]u8 = undefined;
+    const msg = idx.lastError(&buf);
+    try testing.expect(std.mem.startsWith(u8, msg, "/definitely/not/a/real/folder: "));
+}
+
+test "lastError starts empty, keeps the latest failure and truncates to the buffer" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const idx = try fx.open();
+    defer idx.close();
+    var buf: [error_message_max]u8 = undefined;
+    try testing.expectEqualStrings("", idx.lastError(&buf));
+
+    idx.recordError("first", error.SqliteError);
+    idx.recordError("second", error.FileNotFound);
+    try testing.expectEqualStrings("second: FileNotFound", idx.lastError(&buf));
+
+    var small: [6]u8 = undefined;
+    try testing.expectEqualStrings("second", idx.lastError(&small));
+    try testing.expectEqualStrings("", idx.lastError(buf[0..0]));
+
+    const long: [error_message_max * 2]u8 = @splat('p');
+    idx.recordError(&long, error.OutOfMemory);
+    try testing.expectEqual(@as(usize, error_message_max), idx.lastError(&buf).len);
+}
+
+test "rootFileCount does not count a sibling that shares a name prefix" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.touch("proj/a.txt");
+    try fx.touch("proj/b.txt");
+    try fx.touch("proj-old/c.txt");
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+    const proj = try std.fmt.allocPrint(testing.allocator, "{s}/proj", .{fx.root()});
+    defer testing.allocator.free(proj);
+    try testing.expectEqual(@as(u64, 2), idx.rootFileCount(proj));
+    try testing.expectEqual(@as(u64, 0), idx.rootFileCount("/no/such/root"));
+}
+
+test "removing a root leaves siblings that share a name prefix alone" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.touch("proj/a.txt");
+    try fx.touch("proj-old/c.txt");
+    const idx = try fx.open();
+    defer idx.close();
+    const proj = try std.fmt.allocPrint(testing.allocator, "{s}/proj", .{fx.root()});
+    defer testing.allocator.free(proj);
+    const old = try std.fmt.allocPrint(testing.allocator, "{s}/proj-old", .{fx.root()});
+    defer testing.allocator.free(old);
+    _ = try idx.indexRoot(proj, null, null);
+    _ = try idx.indexRoot(old, null, null);
+
+    try idx.removeRoot(proj);
+    try testing.expectEqual(@as(u64, 0), idx.rootFileCount(proj));
+    try testing.expectEqual(@as(u64, 1), idx.rootFileCount(old));
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var hits: [4]Hit = undefined;
+    try testing.expectEqual(@as(usize, 1), try idx.search(arena.allocator(), "c.txt", 0, &hits));
+    try testing.expectEqual(@as(usize, 0), try idx.search(arena.allocator(), "a.txt", 0, &hits));
+}
+
+test "deleting a file under one root does not disturb another root" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    var other: Fixture = undefined;
+    try other.init();
+    defer other.deinit();
+    try fx.touch("gone.txt");
+    try other.touch("stays.txt");
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+    _ = try idx.indexRoot(other.root(), null, null);
+    try fx.tree.dir.deleteFile(testing.io, "gone.txt");
+    _ = try idx.indexRoot(fx.root(), null, null);
+    try testing.expectEqual(@as(u64, 0), idx.rootFileCount(fx.root()));
+    try testing.expectEqual(@as(u64, 1), idx.rootFileCount(other.root()));
+}
+
+test "symlinks are indexed as entries and never followed" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.touch("real/inside.txt");
+    // A link back to the root would loop forever if followed.
+    try fx.tree.dir.symLink(testing.io, fx.root(), "loop", .{ .is_directory = true });
+    const idx = try fx.open();
+    defer idx.close();
+    const n = try idx.indexRoot(fx.root(), null, null);
+    try testing.expectEqual(@as(u64, 3), n); // real, real/inside.txt, loop
+}
+
+test "unreadable folders are skipped, not fatal" {
+    if (std.c.geteuid() == 0) return error.SkipZigTest; // root ignores permission bits
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.touch("open/a.txt");
+    try fx.touch("locked/b.txt");
+    var locked_buf: [std.fs.max_path_bytes + 8]u8 = undefined;
+    const locked = try std.fmt.bufPrintSentinel(&locked_buf, "{s}/locked", .{fx.root()}, 0);
+    const chmod = struct {
+        extern "c" fn chmod(path: [*:0]const u8, mode: c_uint) c_int;
+    }.chmod;
+    try testing.expectEqual(@as(c_int, 0), chmod(locked.ptr, 0));
+    defer _ = chmod(locked.ptr, 0o755); // so the fixture can clean up
+    const idx = try fx.open();
+    defer idx.close();
+    const n = try idx.indexRoot(fx.root(), null, null);
+    try testing.expect(n >= 2); // open, open/a.txt, locked itself
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var hits: [4]Hit = undefined;
+    try testing.expectEqual(@as(usize, 1), try idx.search(arena.allocator(), "a.txt", 0, &hits));
+}
+
+test "long and non-ASCII names round-trip" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.touch("héllo wörld ✓.txt");
+    const long_name = @as([200]u8, @splat('n')) ++ ".txt".*;
+    try fx.touch(&long_name);
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var hits: [4]Hit = undefined;
+    try testing.expectEqual(@as(usize, 1), try idx.search(arena.allocator(), "wörld", 0, &hits));
+    try testing.expect(std.mem.endsWith(u8, hits[0].path, "héllo wörld ✓.txt"));
+    try testing.expectEqual(@as(usize, 1), try idx.search(arena.allocator(), "nnnnnnnn.txt", 0, &hits));
+}
+
+test "the parallel search path agrees with the single-threaded one" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const idx = try fx.open();
+    defer idx.close();
+    const rows = parallel_threshold + 5_000;
+    // Bulk-load rows straight into SQLite: far cheaper than creating that many files.
+    var sql_buf: [512]u8 = undefined;
+    const sql = try std.fmt.bufPrintSentinel(&sql_buf,
+        \\WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < {d})
+        \\INSERT INTO files(path, name, ext, size, mtime, is_dir, seen)
+        \\SELECT '/bulk/dir' || (i % 97) || '/file' || i || '.txt', 'file' || i || '.txt', 'txt', i, i, 0, 1 FROM c
+    , .{rows}, 0);
+    try idx.db.exec(sql);
+    try idx.reload();
+    try testing.expectEqual(@as(u64, rows), idx.fileCount());
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var hits: [max_hits]Hit = undefined;
+    const n = try idx.search(arena.allocator(), "file4242.txt", 0, &hits);
+    try testing.expect(n >= 1);
+    try testing.expect(std.mem.endsWith(u8, hits[0].path, "/file4242.txt"));
+    for (hits[1..n], 0..) |h, i| try testing.expect(hits[i].score >= h.score);
+
+    // Reference: rank the same snapshot on one thread and compare.
+    const q = fuzzy.Query.parse("file4242.txt");
+    var reference: TopK = .{ .k = max_hits };
+    scanRange(&idx.snap, &q, .{}, 0, 0, idx.snap.entries.len, &reference);
+    try testing.expectEqual(reference.n, n);
+    for (hits[0..n], reference.buf[0..n]) |h, r| try testing.expectEqual(r.score, h.score);
+
+    // Filters take the same path.
+    const filtered = try idx.searchFiltered(arena.allocator(), "file", .{ .min_size = rows - 2 }, 0, &hits);
+    try testing.expectEqual(@as(usize, 3), filtered);
+}
+
+test "entries with an empty or oversized path are not loaded" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const idx = try fx.open();
+    defer idx.close();
+    try idx.db.exec("INSERT INTO files(path, name, ext, size, mtime, is_dir, seen) VALUES('', '', '', 0, 0, 0, 1)");
+    const huge = try testing.allocator.alloc(u8, std.math.maxInt(u16) + 1);
+    defer testing.allocator.free(huge);
+    @memset(huge, 'x');
+    huge[0] = '/';
+    const ins = try idx.db.prepare("INSERT INTO files(path, name, ext, size, mtime, is_dir, seen) VALUES(?, 'x', '', 0, 0, 0, 1)");
+    defer ins.finalize();
+    try ins.bindText(1, huge);
+    _ = try ins.step();
+    try idx.db.exec("INSERT INTO files(path, name, ext, size, mtime, is_dir, seen) VALUES('/ok', 'ok', '', 0, 0, 0, 1)");
+    try idx.reload();
+    try testing.expectEqual(@as(u64, 1), idx.fileCount());
+}
+
+test "a negative size in the database loads as zero" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const idx = try fx.open();
+    defer idx.close();
+    try idx.db.exec("INSERT INTO files(path, name, ext, size, mtime, is_dir, seen) VALUES('/neg', 'neg', '', -5, 0, 0, 1)");
+    try idx.reload();
+    try testing.expectEqual(@as(u64, 0), idx.snap.entries[0].size);
+}
+
+test "the home folder's Library is skipped, other folders named Library are not" {
+    const c = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+    };
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.touch("Library/Caches/junk.txt");
+    try fx.touch("Documents/Library/keep.txt");
+    try fx.touch("notes.txt");
+
+    const old_home: ?[:0]u8 = if (std.c.getenv("HOME")) |h| try testing.allocator.dupeSentinel(u8, std.mem.span(h), 0) else null;
+    defer if (old_home) |h| testing.allocator.free(h);
+    var home_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const home = try std.fmt.bufPrintSentinel(&home_buf, "{s}", .{fx.root()}, 0);
+    try testing.expectEqual(@as(c_int, 0), c.setenv("HOME", home.ptr, 1));
+    defer if (old_home) |h| {
+        _ = c.setenv("HOME", h.ptr, 1);
+    };
+
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var hits: [4]Hit = undefined;
+    try testing.expectEqual(@as(usize, 0), try idx.search(arena.allocator(), "junk.txt", 0, &hits));
+    try testing.expectEqual(@as(usize, 1), try idx.search(arena.allocator(), "keep.txt", 0, &hits));
+    try testing.expectEqual(@as(usize, 1), try idx.search(arena.allocator(), "notes.txt", 0, &hits));
+}
+
+test "searches and re-scans can overlap" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    for (0..20) |i| {
+        var name_buf: [32]u8 = undefined;
+        try fx.touch(try std.fmt.bufPrint(&name_buf, "dir/file{d}.txt", .{i}));
+    }
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+
+    const Searcher = struct {
+        fn loop(index: *Index, misses: *std.atomic.Value(u32)) void {
+            var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer arena.deinit();
+            var hits: [8]Hit = undefined;
+            for (0..200) |_| {
+                _ = arena.reset(.retain_capacity);
+                const n = index.search(arena.allocator(), "file", 0, &hits) catch {
+                    _ = misses.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                // A snapshot swap must never expose a half-built snapshot.
+                if (n != 8) _ = misses.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var misses: std.atomic.Value(u32) = .init(0);
+    const t = try std.Thread.spawn(.{}, Searcher.loop, .{ idx, &misses });
+    for (0..10) |_| _ = try idx.indexRoot(fx.root(), null, null);
+    t.join();
+    try testing.expectEqual(@as(u32, 0), misses.load(.monotonic));
+}
+
+fn readLog(fx: *const Fixture) ![]u8 {
+    return fx.db_dir.dir.readFileAlloc(testing.io, "seek.log", testing.allocator, .limited(4 * log_max_bytes));
+}
+
+test "the log sits next to the database and records opens, scans and failures" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.touch("a.txt");
+    const idx = try fx.open();
+    defer idx.close();
+    try testing.expect(std.mem.endsWith(u8, idx.logPath(), "/seek.log"));
+    try testing.expectEqualStrings(std.fs.path.dirname(fx.dbPath()).?, std.fs.path.dirname(idx.logPath()).?);
+
+    _ = try idx.indexRoot(fx.root(), null, null);
+    idx.recordError("add folder", error.FileNotFound);
+
+    const text = try readLog(&fx);
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, " info opened index with 0 entries\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, " info scanned ") != null);
+    try testing.expect(std.mem.indexOf(u8, text, " error add folder: FileNotFound\n") != null);
+    // "2026-10-15T01:02:03Z level ..." — a UTC timestamp leads every line.
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, text, "\n"), '\n');
+    while (lines.next()) |line| {
+        try testing.expect(line.len > 21 and line[4] == '-' and line[10] == 'T' and line[19] == 'Z' and line[20] == ' ');
+    }
+}
+
+test "an in-memory database has no log and logging is harmless" {
+    const idx = try Index.open(testing.allocator, testing.io, ":memory:");
+    defer idx.close();
+    try testing.expectEqualStrings("", idx.logPath());
+    idx.recordError("nowhere to write", error.OutOfMemory);
+    idx.logf("info", "still fine {d}", .{1});
+}
+
+test "the log rotates instead of growing without bound" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const idx = try fx.open();
+    defer idx.close();
+    const filler: [200]u8 = @splat('x');
+    for (0..log_max_bytes / 100) |_| idx.logf("info", "{s}", .{&filler});
+    idx.logf("info", "after rotation", .{});
+
+    const old = try fx.db_dir.dir.readFileAlloc(testing.io, "seek.log.1", testing.allocator, .limited(4 * log_max_bytes));
+    defer testing.allocator.free(old);
+    try testing.expect(old.len > log_max_bytes);
+    const current = try readLog(&fx);
+    defer testing.allocator.free(current);
+    try testing.expect(current.len < log_max_bytes);
+    try testing.expect(std.mem.indexOf(u8, current, "after rotation") != null);
 }

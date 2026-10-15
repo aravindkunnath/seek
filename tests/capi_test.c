@@ -70,6 +70,19 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 5; i++) CHECK(seek_reindex_all(idx, NULL, NULL) == n);
     pthread_join(searcher, NULL);
 
+    /* The diagnostics log exists and records failures. */
+    const char *log = seek_log_path(idx);
+    CHECK(strlen(log) > 0 && access(log, R_OK) == 0);
+
+    /* Failures are reported, not swallowed. */
+    CHECK(strcmp(seek_last_error(idx), "") == 0);
+    CHECK(seek_index_root(idx, "/definitely/not/a/real/folder", NULL, NULL) == -1);
+    CHECK(strstr(seek_last_error(idx), "/definitely/not/a/real/folder") != NULL);
+    CHECK(seek_add_root(idx, "/definitely/not/a/real/folder") == 0);
+    CHECK(seek_reindex_all(idx, NULL, NULL) == n); /* the dead folder is skipped... */
+    CHECK(strstr(seek_last_error(idx), "/definitely/not/a/real/folder") != NULL); /* ...and reported */
+    CHECK(seek_remove_root(idx, "/definitely/not/a/real/folder") == 0);
+
     seek_close(idx);
 
     /* Reopen: the index persists. */

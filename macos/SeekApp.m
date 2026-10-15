@@ -2013,8 +2013,34 @@ static OSStatus OnHotKey(EventHandlerCallRef next, EventRef event, void *userDat
     _loginItem.state = SMAppService.mainAppService.status == SMAppServiceStatusEnabled
                            ? NSControlStateValueOn : NSControlStateValueOff;
     [m addItem:NSMenuItem.separatorItem];
+    NSMenuItem *diag = [m addItemWithTitle:@"Diagnostics & Logging" action:nil keyEquivalent:@""];
+    NSMenu *diagMenu = [[NSMenu alloc] initWithTitle:@"Diagnostics & Logging"];
+    NSMenuItem *openLog = [diagMenu addItemWithTitle:@"Open Log" action:@selector(openLog) keyEquivalent:@""];
+    openLog.target = self;
+    NSMenuItem *showLog = [diagMenu addItemWithTitle:@"Show Log in Finder" action:@selector(revealLog) keyEquivalent:@""];
+    showLog.target = self;
+    diag.submenu = diagMenu;
+    [m addItem:NSMenuItem.separatorItem];
     [m addItemWithTitle:@"Quit Seek" action:@selector(terminate:) keyEquivalent:@"q"];
     _statusItem.menu = m;
+}
+
+/// The diagnostics log written by libseek; nil if the index has none.
+- (NSURL *)logURL {
+    const char *p = seek_log_path(_idx);
+    return p[0] ? [NSURL fileURLWithPath:@(p)] : nil;
+}
+
+- (void)openLog {
+    NSURL *url = [self logURL];
+    if (url) [NSWorkspace.sharedWorkspace openURL:url];
+    else NSBeep();
+}
+
+- (void)revealLog {
+    NSURL *url = [self logURL];
+    if (url) [NSWorkspace.sharedWorkspace activateFileViewerSelectingURLs:@[ url ]];
+    else NSBeep();
 }
 
 - (void)registerHotKey {

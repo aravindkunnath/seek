@@ -101,3 +101,59 @@ pub const Stmt = struct {
         return p[0..n];
     }
 };
+
+test "round-trips text and integers through a statement" {
+    const db = try Db.open(":memory:");
+    defer db.close();
+    try db.exec("CREATE TABLE t(a TEXT, b INTEGER)");
+
+    const ins = try db.prepare("INSERT INTO t VALUES(?, ?)");
+    defer ins.finalize();
+    try ins.bindText(1, "héllo wörld");
+    try ins.bindInt(2, std.math.minInt(i64));
+    try std.testing.expect(!try ins.step());
+    ins.reset();
+    try ins.bindText(1, "");
+    try ins.bindInt(2, std.math.maxInt(i64));
+    try std.testing.expect(!try ins.step());
+
+    const sel = try db.prepare("SELECT a, b FROM t ORDER BY b");
+    defer sel.finalize();
+    try std.testing.expect(try sel.step());
+    try std.testing.expectEqualStrings("héllo wörld", sel.text(0));
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), sel.int(1));
+    try std.testing.expect(try sel.step());
+    try std.testing.expectEqualStrings("", sel.text(0));
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), sel.int(1));
+    try std.testing.expect(!try sel.step());
+}
+
+test "NULL columns read as empty text" {
+    const db = try Db.open(":memory:");
+    defer db.close();
+    const st = try db.prepare("SELECT NULL");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqualStrings("", st.text(0));
+}
+
+test "bad SQL and constraint violations are errors, not crashes" {
+    const db = try Db.open(":memory:");
+    defer db.close();
+    try std.testing.expectError(error.SqliteError, db.exec("NOT SQL"));
+    try std.testing.expectError(error.SqliteError, db.prepare("SELECT * FROM missing_table"));
+    try std.testing.expect(db.errmsg().len > 0);
+
+    try db.exec("CREATE TABLE u(k TEXT PRIMARY KEY)");
+    const st = try db.prepare("INSERT INTO u VALUES(?)");
+    defer st.finalize();
+    try st.bindText(1, "same");
+    try std.testing.expect(!try st.step());
+    st.reset();
+    try st.bindText(1, "same");
+    try std.testing.expectError(error.SqliteError, st.step());
+}
+
+test "opening an unreachable path fails" {
+    try std.testing.expectError(error.SqliteError, Db.open("/nonexistent-dir-for-seek-tests/x.db"));
+}

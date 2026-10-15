@@ -37,6 +37,16 @@ uint32_t seek_root_count(seek_index *idx);
 int64_t seek_index_root(seek_index *idx, const char *abs_path, seek_progress_fn progress, void *ctx);
 int64_t seek_reindex_all(seek_index *idx, seek_progress_fn progress, void *ctx);
 
+/* Human-readable message for the most recent failure on this handle ("" if none), e.g.
+ * "/Volumes/Backup: FileNotFound". Also set when seek_reindex_all skips a folder it couldn't scan
+ * while still returning success. The pointer is valid until the next seek_last_error call on this
+ * handle; call it from one thread at a time. Never NULL. */
+const char *seek_last_error(seek_index *idx);
+
+/* Path of the diagnostics log: a text file, one line per event (opens, scans, failures), kept next to
+ * the database and rotated at 256 KB to seek.log.1. "" if the index has none. Valid until seek_close. */
+const char *seek_log_path(seek_index *idx);
+
 /* Number of entries in the in-memory index. */
 uint64_t seek_file_count(seek_index *idx);
 
