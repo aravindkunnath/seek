@@ -33,7 +33,7 @@ not split.
    at most 1 MB of text per file (configurable), skip binaries (NUL in the first 4 KB), skip the same
    folders the filename index skips, and index at utility QoS so it never competes with typing.
 
-## Open risk: SQLite version
+## SQLite version (resolved: bundled)
 
 `contentless_delete` needs SQLite 3.43.0 or newer. As far as I recall macOS 13 ships 3.39.x and
 macOS 14 ships 3.43.x, and Seek's deployment target is 13.0 (`build.zig`). **Verify on a macOS 13
@@ -45,7 +45,7 @@ machine** (`select sqlite_version()`). If so, the options are:
 - Raise the deployment target to macOS 14.
 - Fall back on older systems to a stored-content table (1.36x) and plain deletes.
 
-Recommendation: bundle SQLite. Guard it with a startup check of `sqlite3_libversion_number()` and
+Decision: SQLite is bundled (`vendor/sqlite`). Guard it with a startup check of `sqlite3_libversion_number()` and
 `PRAGMA compile_options` containing `ENABLE_FTS5`, logged and reported through `seek_last_error`.
 
 ## File resolver and content indexer (next steps)
