@@ -183,6 +183,47 @@ export fn seek_find_same_size(p: *anyopaque, size: u64, out: [*]SeekResult, max:
     return @intCast(n);
 }
 
+pub const DupGroupFn = *const fn (ctx: ?*anyopaque, size: u64, paths: [*]const [*:0]const u8, mtimes: [*]const i64, count: u32) callconv(.c) void;
+
+/// Groups files with identical content: calls `on_group` once per group, biggest saving first,
+/// and returns the number of groups; -1 on failure (see seek_last_error), -2 if `progress`
+/// canceled the run. Blocks while it reads files, so call it from a background thread; search,
+/// scanning and the other calls stay usable meanwhile. Does not use the seek_search result buffer.
+export fn seek_find_duplicates(
+    p: *anyopaque,
+    min_size: u64,
+    progress: ?Index.DupProgressFn,
+    on_group: ?DupGroupFn,
+    ctx: ?*anyopaque,
+) i64 {
+    const idx = handle(p).index;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const groups = idx.findDuplicates(arena, min_size, progress, ctx) catch |err| {
+        if (err == error.Canceled) return -2;
+        idx.recordError("find duplicates", err);
+        return -1;
+    };
+    const cb = on_group orelse return @intCast(groups.len);
+    for (groups) |g| {
+        const paths = arena.alloc([*:0]const u8, g.files.len) catch |err| {
+            idx.recordError("find duplicates", err);
+            return -1;
+        };
+        const mtimes = arena.alloc(i64, g.files.len) catch |err| {
+            idx.recordError("find duplicates", err);
+            return -1;
+        };
+        for (g.files, paths, mtimes) |f, *path, *mtime| {
+            path.* = f.path.ptr;
+            mtime.* = f.mtime;
+        }
+        cb(ctx, g.size, paths.ptr, mtimes.ptr, @intCast(g.files.len));
+    }
+    return @intCast(groups.len);
+}
+
 pub const StrFn = *const fn (ctx: ?*anyopaque, s: [*:0]const u8, n: u64) callconv(.c) void;
 
 /// Calls `cb` once per saved folder with its path and indexed entry count. May wait for a running scan.

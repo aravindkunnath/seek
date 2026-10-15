@@ -160,6 +160,15 @@ const migrations = [_][:0]const u8{
     \\CREATE TABLE IF NOT EXISTS roots(path TEXT PRIMARY KEY);
     \\CREATE TABLE IF NOT EXISTS excludes(pattern TEXT PRIMARY KEY);
     ,
+    // Content hashes for duplicate detection. A row is valid while the file's size and mtime
+    // still match it; rows for files that left the index are pruned by `findDuplicates`.
+    \\CREATE TABLE hashes(
+    \\  path TEXT PRIMARY KEY,
+    \\  size INTEGER NOT NULL,
+    \\  mtime INTEGER NOT NULL, -- nanoseconds
+    \\  hash TEXT NOT NULL
+    \\);
+    ,
 };
 
 /// The `user_version` this build writes and understands.
@@ -900,6 +909,264 @@ pub fn sameSize(self: *Index, arena: Allocator, size: u64, out: []Hit) !usize {
         if (n == out.len) break;
     }
     return n;
+}
+
+// ---------------------------------------------------------------- duplicates
+
+pub const DupFile = struct {
+    path: [:0]const u8, // borrowed from the arena given to `findDuplicates`
+    mtime: i64,
+};
+
+/// Files with identical content. `files` has at least two entries, oldest first.
+pub const DupGroup = struct {
+    size: u64, // of each file
+    files: []DupFile,
+
+    /// Bytes freed by keeping one copy.
+    pub fn reclaimable(g: DupGroup) u64 {
+        return g.size * (g.files.len - 1);
+    }
+};
+
+/// Called as hashing proceeds with files done and total to hash. A nonzero return cancels.
+pub const DupProgressFn = *const fn (ctx: ?*anyopaque, done: u64, total: u64) callconv(.c) c_int;
+
+const hash_len = std.crypto.hash.sha2.Sha256.digest_length;
+const hash_chunk = 64 * 1024;
+
+const Candidate = struct {
+    path: [:0]const u8,
+    size: u64,
+    mtime: i64 = 0, // seconds, shown to the user
+    inode: u64 = 0, // hard links share one: they free nothing when deleted
+    mtime_ns: i64 = 0, // keys the hash cache: an edit within the same second still invalidates it
+    state: enum { unchecked, ready, cached, hashed, skipped } = .unchecked,
+    hash: [hash_len]u8 = undefined,
+};
+
+fn lessBySizeHash(_: void, a: Candidate, b: Candidate) bool {
+    if (a.size != b.size) return a.size < b.size;
+    return std.mem.order(u8, &a.hash, &b.hash) == .lt;
+}
+
+fn lessByInode(_: void, a: Candidate, b: Candidate) bool {
+    return a.inode < b.inode;
+}
+
+fn lessFile(_: void, a: DupFile, b: DupFile) bool {
+    if (a.mtime != b.mtime) return a.mtime < b.mtime;
+    return std.mem.lessThan(u8, a.path, b.path);
+}
+
+fn moreReclaimable(_: void, a: DupGroup, b: DupGroup) bool {
+    if (a.reclaimable() != b.reclaimable()) return a.reclaimable() > b.reclaimable();
+    return a.size > b.size;
+}
+
+/// SHA-256 of the regular file at `path`, without following a symlink. Null when it can't be
+/// read as a whole (gone, unreadable, not a regular file, or no longer `want_size` bytes).
+fn hashFile(self: *Index, buf: []u8, path: []const u8, want_size: u64) ?[hash_len]u8 {
+    const io = self.io;
+    const file = Io.Dir.cwd().openFile(io, path, .{ .follow_symlinks = false }) catch return null;
+    defer file.close(io);
+    // The path may have been swapped for a pipe or device since it was checked: reading one could block forever.
+    const st = file.stat(io) catch return null;
+    if (st.kind != .file or st.size != want_size) return null;
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var off: u64 = 0;
+    while (true) {
+        const n = file.readPositionalAll(io, buf, off) catch return null;
+        h.update(buf[0..n]);
+        off += n;
+        if (n < buf.len) break;
+    }
+    if (off != want_size) return null; // grew or shrank while reading
+    return h.finalResult();
+}
+
+/// Stores the hashes computed in `cands` and forgets hashes of files that left the index.
+fn saveHashes(self: *Index, cands: []const Candidate) !void {
+    self.db_mutex.lockUncancelable(self.io);
+    defer self.db_mutex.unlock(self.io);
+    const db = self.db;
+    try db.exec("BEGIN");
+    var committed = false;
+    defer if (!committed) db.exec("ROLLBACK") catch {};
+    const put = try db.prepare("INSERT OR REPLACE INTO hashes(path, size, mtime, hash) VALUES(?, ?, ?, ?)");
+    defer put.finalize();
+    for (cands) |c| {
+        if (c.state != .hashed) continue;
+        const hex = std.fmt.bytesToHex(c.hash, .lower);
+        put.reset();
+        try put.bindText(1, c.path);
+        try put.bindInt(2, @intCast(c.size));
+        try put.bindInt(3, c.mtime_ns);
+        try put.bindText(4, &hex);
+        _ = try put.step();
+    }
+    try db.exec("DELETE FROM hashes WHERE path NOT IN (SELECT path FROM files)");
+    try db.exec("COMMIT");
+    committed = true;
+}
+
+/// Groups indexed files that have identical content, most reclaimable space first. Only files of
+/// at least `min_size` bytes (empty files never count) that share a size with another are read;
+/// hashes are cached by path, size and mtime, so unchanged files cost nothing the second time.
+/// Symlinks, folders and files that changed or vanished since the last scan are left out.
+/// Paths are copied into `arena`. Reading files takes a while: neither the snapshot nor the
+/// database is locked meanwhile, so search and scanning go on. `progress` may cancel the run,
+/// which returns `error.Canceled` (hashes already computed are kept).
+pub fn findDuplicates(
+    self: *Index,
+    arena: Allocator,
+    min_size: u64,
+    progress: ?DupProgressFn,
+    ctx: ?*anyopaque,
+) ![]DupGroup {
+    const io = self.io;
+    const gpa = self.gpa;
+
+    // 1. Candidates: files that share a size with another file.
+    var cands: std.ArrayList(Candidate) = .empty;
+    {
+        self.mem_mutex.lockUncancelable(io);
+        defer self.mem_mutex.unlock(io);
+        const snap = &self.snap;
+        var order: std.ArrayList(u32) = .empty;
+        defer order.deinit(gpa);
+        const floor = @max(min_size, 1);
+        for (snap.entries, 0..) |e, i| {
+            if (!e.is_dir and e.size >= floor) try order.append(gpa, @intCast(i));
+        }
+        const SizeOrder = struct {
+            entries: []const Entry,
+            fn less(o: @This(), a: u32, b: u32) bool {
+                return o.entries[a].size < o.entries[b].size;
+            }
+        };
+        std.sort.pdq(u32, order.items, SizeOrder{ .entries = snap.entries }, SizeOrder.less);
+        var i: usize = 0;
+        while (i < order.items.len) {
+            const size = snap.entries[order.items[i]].size;
+            var j = i + 1;
+            while (j < order.items.len and snap.entries[order.items[j]].size == size) j += 1;
+            if (j - i >= 2) {
+                for (order.items[i..j]) |k| {
+                    try cands.append(arena, .{
+                        .path = try arena.dupeSentinel(u8, snap.path(snap.entries[k]), 0),
+                        .size = size,
+                    });
+                }
+            }
+            i = j;
+        }
+    }
+
+    // 2. Check each is still a regular file of the indexed size; its mtime keys the cache.
+    for (cands.items) |*c| {
+        const st = Io.Dir.cwd().statFile(io, c.path, .{ .follow_symlinks = false }) catch {
+            c.state = .skipped;
+            continue;
+        };
+        if (st.kind != .file or st.size != c.size) {
+            c.state = .skipped;
+            continue;
+        }
+        c.mtime = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
+        c.mtime_ns = @truncate(st.mtime.nanoseconds);
+        c.inode = @intCast(st.inode);
+        c.state = .ready;
+    }
+
+    // 3. Cached hashes.
+    {
+        self.db_mutex.lockUncancelable(io);
+        defer self.db_mutex.unlock(io);
+        const st = try self.db.prepare("SELECT hash FROM hashes WHERE path=? AND size=? AND mtime=?");
+        defer st.finalize();
+        for (cands.items) |*c| {
+            if (c.state != .ready) continue;
+            st.reset();
+            try st.bindText(1, c.path);
+            try st.bindInt(2, @intCast(c.size));
+            try st.bindInt(3, c.mtime_ns);
+            if (try st.step()) {
+                if (std.fmt.hexToBytes(&c.hash, st.text(0))) |got| {
+                    if (got.len == hash_len) c.state = .cached;
+                } else |_| {}
+            }
+        }
+    }
+
+    // 4. Hash the rest, with no lock held.
+    var todo: u64 = 0;
+    for (cands.items) |c| {
+        if (c.state == .ready) todo += 1;
+    }
+    var canceled = false;
+    var done: u64 = 0;
+    {
+        const buf = try gpa.alloc(u8, hash_chunk);
+        defer gpa.free(buf);
+        for (cands.items) |*c| {
+            if (c.state != .ready) continue;
+            if (self.hashFile(buf, c.path, c.size)) |digest| {
+                c.hash = digest;
+                c.state = .hashed;
+            } else {
+                c.state = .skipped;
+            }
+            done += 1;
+            if (progress) |cb| if (cb(ctx, done, todo) != 0) {
+                canceled = true;
+                break;
+            };
+        }
+    }
+
+    // 5. Remember what was hashed. It is only a cache: failing to save it doesn't lose the result.
+    self.saveHashes(cands.items) catch |err| self.logf("warn", "duplicates: could not save hashes: {t}", .{err});
+    if (canceled) return error.Canceled;
+
+    // 6. Same size and same hash: a group.
+    var known: std.ArrayList(Candidate) = .empty;
+    defer known.deinit(gpa);
+    for (cands.items) |c| {
+        if (c.state == .cached or c.state == .hashed) try known.append(gpa, c);
+    }
+    std.sort.pdq(Candidate, known.items, {}, lessBySizeHash);
+
+    var groups: std.ArrayList(DupGroup) = .empty;
+    var i: usize = 0;
+    while (i < known.items.len) {
+        var j = i + 1;
+        while (j < known.items.len and known.items[j].size == known.items[i].size and
+            std.mem.eql(u8, &known.items[j].hash, &known.items[i].hash)) j += 1;
+        // Names of one file (hard links) count once: removing all but one frees nothing.
+        std.sort.pdq(Candidate, known.items[i..j], {}, lessByInode);
+        var distinct: usize = 0;
+        for (known.items[i..j], 0..) |c, k| {
+            if (k == 0 or c.inode != known.items[i + k - 1].inode) {
+                known.items[i + distinct] = c;
+                distinct += 1;
+            }
+        }
+        if (distinct >= 2) {
+            const files = try arena.alloc(DupFile, distinct);
+            for (known.items[i..][0..distinct], files) |c, *f| f.* = .{ .path = c.path, .mtime = c.mtime };
+            std.sort.pdq(DupFile, files, {}, lessFile);
+            try groups.append(arena, .{ .size = known.items[i].size, .files = files });
+        }
+        i = j;
+    }
+    std.sort.pdq(DupGroup, groups.items, {}, moreReclaimable);
+    var skipped: usize = 0;
+    for (cands.items) |c| {
+        if (c.state == .skipped) skipped += 1;
+    }
+    self.logf("info", "duplicates: {d} groups from {d} same-size files ({d} hashed, {d} skipped as unreadable or changed)", .{ groups.items.len, cands.items.len, done, skipped });
+    return groups.items;
 }
 
 test "index a temp tree and search it" {
@@ -2163,4 +2430,202 @@ test "an unreadable in-memory or missing database is an error, not a recovery" {
     try testing.expectError(error.DatabaseCorrupt, idx.recover(":memory:"));
     try testing.expectError(error.DatabaseCorrupt, idx.recover(fx.dbPath()));
     try testing.expect(!dbDirHas(&fx, "seek.db.corrupt"));
+}
+
+// ---------------------------------------------------------------- duplicate tests
+
+fn setMtime(fx: *Fixture, path: []const u8, secs: i64) !void {
+    const f = try fx.tree.dir.openFile(testing.io, path, .{ .mode = .read_write });
+    defer f.close(testing.io);
+    try f.setTimestamps(testing.io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(secs * std.time.ns_per_s) } });
+}
+
+const DupCounter = struct {
+    calls: u64 = 0,
+    cancel_after: u64 = std.math.maxInt(u64),
+
+    fn cb(ctx: ?*anyopaque, done: u64, total: u64) callconv(.c) c_int {
+        _ = total;
+        const self: *DupCounter = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        return @intFromBool(done >= self.cancel_after);
+    }
+};
+
+fn hashRows(idx: *Index) !i64 {
+    const st = try idx.db.prepare("SELECT COUNT(*) FROM hashes");
+    defer st.finalize();
+    _ = try st.step();
+    return st.int(0);
+}
+
+test "findDuplicates groups identical content, biggest saving first, oldest copy first" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const big_a: [1000]u8 = @splat('A');
+    const big_b: [1000]u8 = @splat('B');
+    try fx.write("a/one.txt", "hello");
+    try fx.write("b/two.txt", "hello");
+    try fx.write("c/three.txt", "world"); // same size as the others, different content
+    try fx.write("d/big1.bin", &big_a);
+    try fx.write("e/big2.bin", &big_a);
+    try fx.write("e/big3.bin", &big_a);
+    try fx.write("f/big4.bin", &big_b);
+    try fx.write("g/only.txt", "unique size");
+    try fx.touch("h/empty1");
+    try fx.touch("h/empty2");
+    try setMtime(&fx, "a/one.txt", 2_000_000);
+    try setMtime(&fx, "b/two.txt", 1_000_000);
+
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const groups = try idx.findDuplicates(arena_state.allocator(), 0, null, null);
+
+    try testing.expectEqual(@as(usize, 2), groups.len);
+    try testing.expectEqual(@as(u64, 1000), groups[0].size);
+    try testing.expectEqual(@as(usize, 3), groups[0].files.len);
+    try testing.expectEqual(@as(u64, 2000), groups[0].reclaimable());
+    try testing.expectEqual(@as(u64, 5), groups[1].size);
+    try testing.expectEqual(@as(usize, 2), groups[1].files.len);
+    try testing.expect(std.mem.endsWith(u8, groups[1].files[0].path, "b/two.txt")); // older first
+    try testing.expect(std.mem.endsWith(u8, groups[1].files[1].path, "a/one.txt"));
+    try testing.expectEqual(@as(i64, 1_000_000), groups[1].files[0].mtime);
+    for (groups) |g| for (g.files) |f| {
+        try testing.expect(std.mem.indexOf(u8, f.path, "empty") == null);
+        try testing.expect(std.mem.indexOf(u8, f.path, "three") == null);
+    };
+}
+
+test "findDuplicates honours min_size and skips symlinks" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.write("a.txt", "hello");
+    try fx.write("b.txt", "hello");
+    const big: [100]u8 = @splat('X');
+    try fx.write("big1", &big);
+    try fx.write("big2", &big);
+    // A dangling link whose target path is 5 bytes: indexed with size 5, like the files above.
+    try fx.tree.dir.symLink(testing.io, "abcde", "link", .{});
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    const all = try idx.findDuplicates(arena_state.allocator(), 0, null, null);
+    try testing.expectEqual(@as(usize, 2), all.len);
+    for (all) |g| for (g.files) |f| try testing.expect(!std.mem.endsWith(u8, f.path, "link"));
+
+    const large = try idx.findDuplicates(arena_state.allocator(), 50, null, null);
+    try testing.expectEqual(@as(usize, 1), large.len);
+    try testing.expectEqual(@as(u64, 100), large[0].size);
+}
+
+test "unchanged files are served from the hash cache, edited ones are rehashed" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.write("a.txt", "hello");
+    try fx.write("b.txt", "hello");
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var counter: DupCounter = .{};
+    try testing.expectEqual(@as(usize, 1), (try idx.findDuplicates(arena, 0, DupCounter.cb, &counter)).len);
+    try testing.expectEqual(@as(u64, 2), counter.calls); // both files read
+    try testing.expectEqual(@as(i64, 2), try hashRows(idx));
+
+    counter = .{};
+    try testing.expectEqual(@as(usize, 1), (try idx.findDuplicates(arena, 0, DupCounter.cb, &counter)).len);
+    try testing.expectEqual(@as(u64, 0), counter.calls); // nothing read
+
+    // Same size, different content, new mtime: no longer a duplicate, and only b.txt is read again.
+    try fx.write("b.txt", "world");
+    try setMtime(&fx, "b.txt", 3_000_000);
+    counter = .{};
+    try testing.expectEqual(@as(usize, 0), (try idx.findDuplicates(arena, 0, DupCounter.cb, &counter)).len);
+    try testing.expectEqual(@as(u64, 1), counter.calls);
+}
+
+test "a canceled run keeps the hashes it computed" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    inline for (.{ "a", "b", "c", "d" }) |n| try fx.write(n, "same!");
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var counter: DupCounter = .{ .cancel_after = 2 };
+    try testing.expectError(error.Canceled, idx.findDuplicates(arena, 0, DupCounter.cb, &counter));
+    try testing.expectEqual(@as(i64, 2), try hashRows(idx));
+
+    counter = .{};
+    const groups = try idx.findDuplicates(arena, 0, DupCounter.cb, &counter);
+    try testing.expectEqual(@as(usize, 1), groups.len);
+    try testing.expectEqual(@as(usize, 4), groups[0].files.len);
+    try testing.expectEqual(@as(u64, 2), counter.calls); // only the two not yet hashed
+}
+
+test "hashes of files that left the index are forgotten" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.write("a.txt", "hello");
+    try fx.write("b.txt", "hello");
+    try fx.write("c.txt", "hello");
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expectEqual(@as(usize, 3), (try idx.findDuplicates(arena_state.allocator(), 0, null, null))[0].files.len);
+    try testing.expectEqual(@as(i64, 3), try hashRows(idx));
+
+    try fx.tree.dir.deleteFile(testing.io, "c.txt");
+    _ = try idx.indexRoot(fx.root(), null, null);
+    try testing.expectEqual(@as(usize, 2), (try idx.findDuplicates(arena_state.allocator(), 0, null, null))[0].files.len);
+    try testing.expectEqual(@as(i64, 2), try hashRows(idx));
+}
+
+test "findDuplicates on an empty index finds nothing" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const idx = try fx.open();
+    defer idx.close();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expectEqual(@as(usize, 0), (try idx.findDuplicates(arena_state.allocator(), 0, null, null)).len);
+}
+
+test "hard links to one file are not duplicates of each other" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.write("a.txt", "hello");
+    try fx.write("copy.txt", "hello");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const target = try std.fmt.bufPrint(&buf, "{s}/a.txt", .{fx.root()});
+    try Io.Dir.hardLink(.cwd(), target, fx.tree.dir, "link.txt", testing.io, .{});
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const groups = try idx.findDuplicates(arena_state.allocator(), 0, null, null);
+    try testing.expectEqual(@as(usize, 1), groups.len);
+    try testing.expectEqual(@as(usize, 2), groups[0].files.len); // a.txt/link.txt count once, plus copy.txt
 }

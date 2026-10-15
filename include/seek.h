@@ -73,6 +73,23 @@ int seek_search_filtered(seek_index *idx, const char *query, const seek_filter *
  * Shares its result buffer with seek_search (call from the same thread). */
 int seek_find_same_size(seek_index *idx, uint64_t size, seek_result *out, int max);
 
+/* Duplicate detection. Finds files with identical content (compared by SHA-256, so a match is
+ * certain, not a guess) among the indexed files of at least min_size bytes; empty files, folders
+ * and symlinks never count. Calls on_group once per group, the one that would free the most space
+ * first: size is each file's size, and paths/mtimes hold count (>= 2) entries, oldest copy first,
+ * valid only during the call. Returns the number of groups, -1 on failure (see seek_last_error),
+ * or -2 if progress returned nonzero to cancel (hashes already computed are kept).
+ * progress (may be NULL) is called after each file is read, with files done and total to read;
+ * files hashed on an earlier run are not read again unless they changed.
+ * Reads file contents, so it can take minutes on a large index: call it from a background thread.
+ * Search and scanning keep working meanwhile, and it does not touch the seek_search result buffer.
+ * Hard links to one file count once. Cancel via progress and wait for the call to return before
+ * seek_close. */
+typedef int (*seek_dup_progress_fn)(void *ctx, uint64_t done, uint64_t total);
+typedef void (*seek_dup_group_fn)(void *ctx, uint64_t size, const char *const *paths, const int64_t *mtimes, uint32_t count);
+int64_t seek_find_duplicates(seek_index *idx, uint64_t min_size, seek_dup_progress_fn progress,
+                             seek_dup_group_fn on_group, void *ctx);
+
 /* Folder and exclusion management. The list functions call cb once per item (n = entry count for
  * folders, 0 otherwise) and may block while a scan runs: call them from a background thread. */
 typedef void (*seek_str_fn)(void *ctx, const char *s, uint64_t n);
