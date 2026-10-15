@@ -642,13 +642,6 @@ static NSImageView *SymbolView(NSString *name, CGFloat size, NSColor *tint) {
     return v;
 }
 
-static NSButton *PushButton(NSString *title, NSRect frame, BOOL prominent) {
-    NSButton *b = [NSButton buttonWithTitle:title target:nil action:nil];
-    b.frame = frame;
-    if (prominent) b.bezelColor = NSColor.controlAccentColor;
-    return b;
-}
-
 // ------------------------------------------------------------------ settings
 
 @protocol SeekSettingsHost <NSObject>
@@ -1603,93 +1596,6 @@ static BOOL IsProtectedFolder(NSString *path) {
 - (void)finished { _allDone = YES; [self refreshReady]; }
 @end
 
-// Sample content only: duplicate detection (content hashing) is not in the core yet.
-static NSWindow *BuildDuplicatesWindow(void) {
-    const CGFloat W = 760, H = 580, pad = 20, cw = W - pad * 2;
-    NSWindow *win = MakeWindow(@"Duplicates (preview)", W, H);
-    SeekFlipView *root = [[SeekFlipView alloc] initWithFrame:NSMakeRect(0, 0, W, H)];
-
-    NSTextField *query = MakeLabel(@"kind:image year:2019 is:duplicate", 20, NSFontWeightRegular, NSColor.labelColor);
-    query.frame = NSMakeRect(pad, 18, cw, 26);
-    [root addSubview:query];
-    CGFloat cx = pad;
-    for (NSString *c in @[ @"Kind: Image", @"Year: 2019", @"Duplicates only" ]) {
-        SeekChip *chip = [[SeekChip alloc] initWithTitle:c caret:![c hasPrefix:@"Dup"]];
-        chip.frame = NSMakeRect(cx, 54, chip.frame.size.width, 26);
-        cx += chip.frame.size.width + 8;
-        [root addSubview:chip];
-    }
-
-    SeekCard *summary = [[SeekCard alloc] initWithFrame:NSMakeRect(pad, 94, cw, 62)];
-    NSTextField *big = MakeLabel(@"38 groups", 24, NSFontWeightSemibold, NSColor.labelColor);
-    big.frame = NSMakeRect(14, 14, 150, 32);
-    NSTextField *meta = MakeLabel(@"76 files · 412 MB recoverable\nKeeping the oldest copy of each by default", 12,
-                                  NSFontWeightRegular, NSColor.secondaryLabelColor);
-    meta.maximumNumberOfLines = 2;
-    meta.frame = NSMakeRect(172, 12, 280, 38);
-    [summary addSubview:big];
-    [summary addSubview:meta];
-    [summary addSubview:PushButton(@"Review all", NSMakeRect(cw - 12 - 170 - 8 - 90, 17, 90, 28), NO)];
-    [summary addSubview:PushButton(@"Move 38 extras to Trash", NSMakeRect(cw - 12 - 170, 17, 170, 28), YES)];
-    [root addSubview:summary];
-
-    NSArray *groups = @[
-        @[ @"IMG_2231.jpg", @"4.1 MB · 2 copies · Aug 2019", @[
-            @[ @"~/Pictures/2019/Lisbon/IMG_2231.jpg", @"12 Aug 2019", @YES ],
-            @[ @"~/Desktop/Backup old/IMG_2231.jpg", @"03 Jan 2021", @NO ] ] ],
-        @[ @"IMG_2240.jpg", @"3.8 MB · 3 copies · Aug 2019", @[
-            @[ @"~/Pictures/2019/Lisbon/IMG_2240.jpg", @"12 Aug 2019", @YES ],
-            @[ @"~/Dropbox/Camera Uploads/IMG_2240.jpg", @"13 Aug 2019", @NO ],
-            @[ @"~/Desktop/Backup old/IMG_2240.jpg", @"03 Jan 2021", @NO ] ] ],
-        @[ @"wedding-final.heic", @"2.9 MB · 2 copies · Jun 2019", @[
-            @[ @"~/Pictures/Events/Wedding/wedding-final.heic", @"22 Jun 2019", @YES ],
-            @[ @"~/Downloads/wedding-final.heic", @"30 Jun 2019", @NO ] ] ],
-    ];
-    CGFloat y = 170;
-    for (NSArray *g in groups) {
-        NSArray *copies = g[2];
-        SeekCard *card = [[SeekCard alloc] initWithFrame:NSMakeRect(pad, y, cw, 44 + copies.count * 28)];
-        NSView *sw = [[NSView alloc] initWithFrame:NSMakeRect(12, 8, 28, 28)];
-        sw.wantsLayer = YES;
-        sw.layer.cornerRadius = 6;
-        sw.layer.backgroundColor = [NSColor.tertiaryLabelColor colorWithAlphaComponent:0.5].CGColor;
-        NSTextField *n = MakeLabel(g[0], 14, NSFontWeightSemibold, NSColor.labelColor);
-        n.frame = NSMakeRect(50, 12, 300, 20);
-        NSTextField *m = MakeLabel(g[1], 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
-        m.alignment = NSTextAlignmentRight;
-        m.frame = NSMakeRect(cw - 12 - 240, 14, 240, 16);
-        NSBox *sep = [[NSBox alloc] initWithFrame:NSMakeRect(0, 43, cw, 1)];
-        sep.boxType = NSBoxSeparator;
-        for (NSView *v in @[ sw, n, m, sep ]) [card addSubview:v];
-        for (NSUInteger i = 0; i < copies.count; i++) {
-            BOOL keep = [copies[i][2] boolValue];
-            CGFloat ry = 44 + i * 28;
-            NSImageView *dot = SymbolView(keep ? @"checkmark.circle.fill" : @"circle", 14,
-                                          keep ? NSColor.systemGreenColor : NSColor.tertiaryLabelColor);
-            dot.frame = NSMakeRect(12, ry + 6, 16, 16);
-            NSTextField *p = MakeLabel(copies[i][0], 12, NSFontWeightRegular, NSColor.labelColor);
-            p.lineBreakMode = NSLineBreakByTruncatingHead;
-            p.frame = NSMakeRect(36, ry + 6, cw - 36 - 170, 16);
-            NSTextField *d = MakeLabel(copies[i][1], 12, NSFontWeightRegular, NSColor.tertiaryLabelColor);
-            d.alignment = NSTextAlignmentRight;
-            d.frame = NSMakeRect(cw - 12 - 150, ry + 6, 90, 16);
-            NSTextField *t = MakeLabel(keep ? @"Keep" : @"Extra", 12, NSFontWeightSemibold,
-                                       keep ? NSColor.systemGreenColor : NSColor.systemOrangeColor);
-            t.alignment = NSTextAlignmentRight;
-            t.frame = NSMakeRect(cw - 12 - 50, ry + 6, 50, 16);
-            for (NSView *v in @[ dot, p, d, t ]) [card addSubview:v];
-        }
-        [root addSubview:card];
-        y += card.frame.size.height + 10;
-    }
-    NSTextField *foot = MakeLabel(@"Nothing is deleted without confirmation. Trashed files can be restored from Finder.", 12,
-                                  NSFontWeightRegular, NSColor.secondaryLabelColor);
-    foot.frame = NSMakeRect(pad, H - 34, cw, 16);
-    [root addSubview:foot];
-    win.contentView = root;
-    return win;
-}
-
 static void OnIndexProgress(void *ctx, uint64_t seen);
 
 static OSStatus OnHotKey(EventHandlerCallRef next, EventRef event, void *userData);
@@ -1728,7 +1634,6 @@ static OSStatus OnHotKey(EventHandlerCallRef next, EventRef event, void *userDat
     SeekSettings *_settings;
     SeekOnboarding *_onboarding;
     NSString *_statusLine;
-    NSWindow *_duplicatesWindow;
     NSArray<SeekItem *> *_results;
     NSString *_lastQuery;
     dispatch_queue_t _searchQueue;
@@ -1999,8 +1904,6 @@ static OSStatus OnHotKey(EventHandlerCallRef next, EventRef event, void *userDat
     _statusMenuLine.enabled = NO;
     NSMenuItem *welcome = [m addItemWithTitle:@"Welcome Tour…" action:@selector(showOnboarding) keyEquivalent:@""];
     welcome.target = self;
-    NSMenuItem *dups = [m addItemWithTitle:@"Duplicates…" action:@selector(showDuplicates) keyEquivalent:@""];
-    dups.target = self;
     NSMenuItem *prefs = [m addItemWithTitle:@"Settings…" action:@selector(showSettings) keyEquivalent:@","];
     prefs.target = self;
     [m addItem:NSMenuItem.separatorItem];
@@ -2611,11 +2514,6 @@ static OSStatus OnHotKey(EventHandlerCallRef next, EventRef event, void *userDat
         free((void *)p);
         seek_reindex_all(idx, OnIndexProgress, ctx);
     }];
-}
-
-- (void)showDuplicates {
-    if (!_duplicatesWindow) _duplicatesWindow = BuildDuplicatesWindow();
-    [self showWindow:_duplicatesWindow];
 }
 
 - (void)showWindow:(NSWindow *)w {
