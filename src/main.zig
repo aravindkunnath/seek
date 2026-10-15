@@ -42,6 +42,12 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     defer idx.close();
+    {
+        // Set when opening had to replace a damaged database: results will be empty until a rescan.
+        var err_buf: [Index.error_message_max]u8 = undefined;
+        const msg = idx.lastError(&err_buf);
+        if (msg.len > 0) std.debug.print("seek: {s} (see {s})\n", .{ msg, idx.logPath() });
+    }
 
     if (std.mem.eql(u8, cmd, "index")) {
         const t0 = Io.Timestamp.now(io, .awake);
