@@ -21,17 +21,17 @@ snap: Snapshot = .{},
 
 /// Directory names that are never descended into or indexed.
 pub const default_excludes = [_][]const u8{
-    ".git",           ".hg",          ".svn",        "node_modules", ".npm",       ".cache",
-    ".Trash",         ".zig-cache",   "zig-cache",   "zig-out",      "__pycache__", ".venv",
-    ".gradle",        ".cargo",       ".rustup",     ".nix-defexpr", ".DS_Store",   ".Spotlight-V100",
-    ".fseventsd",     ".DocumentRevisions-V100", ".TemporaryItems", ".homebrew",
+    ".git",       ".hg",                     ".svn",            "node_modules", ".npm",        ".cache",
+    ".Trash",     ".zig-cache",              "zig-cache",       "zig-out",      "__pycache__", ".venv",
+    ".gradle",    ".cargo",                  ".rustup",         ".nix-defexpr", ".DS_Store",   ".Spotlight-V100",
+    ".fseventsd", ".DocumentRevisions-V100", ".TemporaryItems", ".homebrew",
 };
 
 /// Directories with these suffixes are macOS bundles: indexed as one entry, not descended into.
 const package_suffixes = [_][]const u8{
-    ".app",         ".photoslibrary", ".framework", ".bundle", ".musiclibrary",
-    ".tvlibrary",   ".imovielibrary", ".fcpbundle", ".xcarchive", ".kext",
-    ".plugin",      ".appex",
+    ".app",       ".photoslibrary", ".framework", ".bundle",    ".musiclibrary",
+    ".tvlibrary", ".imovielibrary", ".fcpbundle", ".xcarchive", ".kext",
+    ".plugin",    ".appex",
 };
 
 /// `$HOME/Library` is huge and mostly caches, so it's skipped when indexing the home folder.

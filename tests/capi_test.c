@@ -5,11 +5,21 @@
 #include <string.h>
 #include <limits.h>
 #include <unistd.h>
+#include <pthread.h>
 
 static uint64_t last_progress = 0;
 static void on_progress(void *ctx, uint64_t n) { (void)ctx; last_progress = n; }
 
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); return 1; } } while (0)
+
+/* Searches on one thread while another re-scans: the concurrency contract in seek.h.
+ * Meaningful under ThreadSanitizer (zig build test-tsan). */
+static void *search_loop(void *arg) {
+    seek_index *idx = arg;
+    seek_result res[16];
+    for (int i = 0; i < 300; i++) seek_search(idx, "index", res, 16);
+    return NULL;
+}
 
 int main(int argc, char **argv) {
     CHECK(argc == 2);
@@ -54,6 +64,11 @@ int main(int argc, char **argv) {
     CHECK(seek_search(idx, "no-such-file-xyzzy", res, 16) == 0);
     CHECK(seek_search(idx, "", res, 16) == 0);
     CHECK(seek_reindex_all(idx, NULL, NULL) == n);
+
+    pthread_t searcher;
+    CHECK(pthread_create(&searcher, NULL, search_loop, idx) == 0);
+    for (int i = 0; i < 5; i++) CHECK(seek_reindex_all(idx, NULL, NULL) == n);
+    pthread_join(searcher, NULL);
 
     seek_close(idx);
 

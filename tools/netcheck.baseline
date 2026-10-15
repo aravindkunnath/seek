@@ -1,0 +1,18 @@
+# Networking-related symbols that Zig's standard library (std.Io.Threaded) imports even though
+# Seek never calls them (tools/lint.sh forbids std.net / std.http / sockets in our sources).
+# Anything networking-related that is NOT listed here fails tools/netcheck.sh.
+_accept
+_bind
+_connect
+_freeaddrinfo
+_getaddrinfo
+_getsockname
+_if_nametoindex
+_listen
+_recvmsg
+_sendfile
+_sendmsg
+_setsockopt
+_shutdown
+_socket
+_socketpair

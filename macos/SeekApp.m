@@ -556,10 +556,11 @@ static NSData *FileDigest(NSString *path, size_t limit) {
     unsigned char *buf = malloc(kChunk);
     size_t left = limit ?: SIZE_MAX;
     while (left > 0) {
-        size_t n = fread(buf, 1, MIN(kChunk, left), f);
-        if (n == 0) break;
-        CC_SHA256_Update(&ctx, buf, (CC_LONG)n);
+        size_t want = MIN(kChunk, left);
+        size_t n = fread(buf, 1, want, f);
+        if (n > 0) CC_SHA256_Update(&ctx, buf, (CC_LONG)n);
         left -= n;
+        if (n < want) break; // end of file or a read error: stop either way
     }
     free(buf);
     fclose(f);

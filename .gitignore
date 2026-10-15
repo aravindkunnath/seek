@@ -4,3 +4,6 @@ zig-out/
 *.db-wal
 *.db-shm
 .DS_Store
+
+# Claude Code local overrides
+.claude/settings.local.json

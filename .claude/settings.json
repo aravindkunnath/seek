@@ -1,0 +1,47 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(zig build:*)",
+      "Bash(zig fmt:*)",
+      "Bash(zig version)",
+      "Bash(tools/lint.sh:*)",
+      "Bash(tools/netcheck.sh:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(pgrep:*)",
+      "Bash(nm:*)",
+      "Bash(otool:*)"
+    ],
+    "ask": [
+      "Edit(tools/netcheck.baseline)",
+      "Bash(git push:*)",
+      "Bash(git commit:*)"
+    ],
+    "deny": [
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(rm -rf ~/Library/Application Support/Seek:*)",
+      "Edit(zig-out/**)",
+      "Edit(.zig-cache/**)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/after-edit.sh" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/before-stop.sh", "timeout": 300 }
+        ]
+      }
+    ]
+  }
+}
