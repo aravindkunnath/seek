@@ -134,9 +134,18 @@ fn kindOf(name: []const u8) Filter.Kind {
 
 pub const ProgressFn = *const fn (ctx: ?*anyopaque, files_seen: u64) callconv(.c) void;
 
-const schema =
+/// Per-connection settings, applied on every open. The busy timeout lets the app and the CLI
+/// share a database: a connection waits for the other's write instead of failing.
+const connection_setup =
+    \\PRAGMA busy_timeout=5000;
     \\PRAGMA journal_mode=WAL;
     \\PRAGMA synchronous=NORMAL;
+;
+
+/// The schema, as steps oldest first: step `i` moves a database from `user_version` i to i + 1.
+/// Add a step to change the schema; never edit one that has shipped. Step 1 uses IF NOT EXISTS
+/// so databases created before versioning (version 0, tables already present) adopt it as is.
+const migrations = [_][:0]const u8{
     \\CREATE TABLE IF NOT EXISTS files(
     \\  id INTEGER PRIMARY KEY,
     \\  path TEXT NOT NULL UNIQUE,
@@ -150,23 +159,103 @@ const schema =
     \\CREATE INDEX IF NOT EXISTS files_size ON files(size);
     \\CREATE TABLE IF NOT EXISTS roots(path TEXT PRIMARY KEY);
     \\CREATE TABLE IF NOT EXISTS excludes(pattern TEXT PRIMARY KEY);
-;
+    ,
+};
 
+/// The `user_version` this build writes and understands.
+pub const schema_version: i32 = migrations.len;
+
+/// Brings `db` up to `steps.len`, all steps in one transaction, and returns the version it
+/// started at. A version this build doesn't know (newer, or negative) is `UnsupportedSchemaVersion`
+/// and leaves the database untouched; so does a failing step.
+fn migrate(db: sqlite.Db, steps: []const [:0]const u8) !i64 {
+    // IMMEDIATE takes the write lock up front, so two processes opening at once can't both migrate.
+    try db.exec("BEGIN IMMEDIATE");
+    var committed = false;
+    defer if (!committed) db.exec("ROLLBACK") catch {};
+    const from = try db.userVersion();
+    if (from < 0 or from > steps.len) return error.UnsupportedSchemaVersion;
+    for (steps[@intCast(from)..]) |sql| try db.exec(sql);
+    if (from != steps.len) try db.setUserVersion(@intCast(steps.len));
+    try db.exec("COMMIT");
+    committed = true;
+    return from;
+}
+
+/// Opens or creates the index at `db_path` (or ":memory:"). A database that is damaged, isn't a
+/// database, or comes from a newer Seek is moved aside (`seek.db.corrupt` / `seek.db.newer`) and
+/// replaced by an empty one that keeps whatever folders and exclusions could still be read; the
+/// next scan refills it. That is logged and reported by `lastError`.
 pub fn open(gpa: Allocator, io: Io, db_path: [:0]const u8) !*Index {
-    const db = try sqlite.Db.open(db_path);
-    errdefer db.close();
-    try db.exec(schema);
     const self = try gpa.create(Index);
     errdefer gpa.destroy(self);
-    self.* = .{ .gpa = gpa, .io = io, .db = db };
+    self.* = .{ .gpa = gpa, .io = io, .db = undefined };
     errdefer self.freeLogPaths();
     if (std.fs.path.dirname(db_path)) |dir| {
         self.log_path = try std.fmt.allocPrintSentinel(gpa, "{s}/seek.log", .{dir}, 0);
         self.log_old_path = try std.fmt.allocPrintSentinel(gpa, "{s}/seek.log.1", .{dir}, 0);
     }
-    try self.reload();
+    self.openDb(db_path) catch |err| switch (err) {
+        error.DatabaseCorrupt, error.UnsupportedSchemaVersion => try self.recover(db_path, err),
+        else => |e| return e,
+    };
     self.logf("info", "opened index with {d} entries", .{self.fileCount()});
     return self;
+}
+
+/// Opens the database, migrates it and loads the snapshot. On failure nothing stays open.
+fn openDb(self: *Index, db_path: [:0]const u8) !void {
+    const db = try sqlite.Db.open(db_path);
+    errdefer db.close();
+    try db.exec(connection_setup);
+    const from = try migrate(db, &migrations);
+    self.db = db;
+    try self.reload(); // reads every row, so damage in the files table shows up here
+    if (from != schema_version) self.logf("info", "database schema {d} -> {d}", .{ from, schema_version });
+}
+
+/// Sets an unusable database aside and opens a fresh one in its place, carrying over the folders
+/// and exclusions that can still be read. Returns `cause` when there is no file to set aside.
+fn recover(self: *Index, db_path: [:0]const u8, cause: anyerror) !void {
+    if (std.mem.eql(u8, db_path, ":memory:")) return cause;
+    const gpa = self.gpa;
+    const suffix = if (cause == error.UnsupportedSchemaVersion) "newer" else "corrupt";
+    const aside = try std.fmt.allocPrintSentinel(gpa, "{s}.{s}", .{ db_path, suffix }, 0);
+    defer gpa.free(aside);
+    if (std.c.rename(db_path.ptr, aside.ptr) != 0) return cause; // missing or can't be moved: give up
+    // The write-ahead log belongs to the old file; a fresh database must not start with it.
+    // (-shm is only a cache of the log's index.)
+    const wal = try std.fmt.allocPrintSentinel(gpa, "{s}-wal", .{db_path}, 0);
+    defer gpa.free(wal);
+    const aside_wal = try std.fmt.allocPrintSentinel(gpa, "{s}-wal", .{aside}, 0);
+    defer gpa.free(aside_wal);
+    const shm = try std.fmt.allocPrintSentinel(gpa, "{s}-shm", .{db_path}, 0);
+    defer gpa.free(shm);
+    _ = std.c.rename(wal.ptr, aside_wal.ptr); // usually absent
+    _ = std.c.unlink(shm.ptr);
+
+    const kept_roots = salvage(gpa, aside, "SELECT path FROM roots ORDER BY path");
+    defer freeRoots(gpa, kept_roots);
+    const kept_excludes = salvage(gpa, aside, "SELECT pattern FROM excludes ORDER BY pattern");
+    defer freeRoots(gpa, kept_excludes);
+
+    try self.openDb(db_path);
+    errdefer {
+        self.snap.deinit(gpa);
+        self.db.close();
+    }
+    for (kept_roots) |r| try self.addRoot(r);
+    for (kept_excludes) |p| try self.addExclude(p);
+    self.logf("warn", "moved the old database to {s}; kept {d} folder(s) and {d} exclusion(s)", .{ aside, kept_roots.len, kept_excludes.len });
+    self.recordError("the index database was unusable and has been replaced", cause);
+}
+
+/// Best-effort read of one text column from a database being given up on: whatever can't be
+/// read is simply not carried over, so every failure yields an empty list.
+fn salvage(gpa: Allocator, db_path: [:0]const u8, sql: []const u8) [][]u8 {
+    const db = sqlite.Db.openReadOnly(db_path) catch return &.{};
+    defer db.close();
+    return textColumn(gpa, db, sql) catch &.{};
 }
 
 fn freeLogPaths(self: *Index) void {
@@ -268,7 +357,12 @@ pub fn addRoot(self: *Index, root: []const u8) !void {
 pub fn roots(self: *Index, gpa: Allocator) ![][]u8 {
     self.db_mutex.lockUncancelable(self.io);
     defer self.db_mutex.unlock(self.io);
-    const st = try self.db.prepare("SELECT path FROM roots ORDER BY path");
+    return textColumn(gpa, self.db, "SELECT path FROM roots ORDER BY path");
+}
+
+/// Runs `sql` and returns its first column as text, one item per row. Free with `freeRoots`.
+fn textColumn(gpa: Allocator, db: sqlite.Db, sql: []const u8) ![][]u8 {
+    const st = try db.prepare(sql);
     defer st.finalize();
     var list: std.ArrayList([]u8) = .empty;
     errdefer {
@@ -353,15 +447,7 @@ pub fn excludes(self: *Index, gpa: Allocator) ![][]u8 {
 }
 
 fn excludesLocked(self: *Index, gpa: Allocator) ![][]u8 {
-    const st = try self.db.prepare("SELECT pattern FROM excludes ORDER BY pattern");
-    defer st.finalize();
-    var list: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (list.items) |r| gpa.free(r);
-        list.deinit(gpa);
-    }
-    while (try st.step()) try list.append(gpa, try gpa.dupe(u8, st.text(0)));
-    return list.toOwnedSlice(gpa);
+    return textColumn(gpa, self.db, "SELECT pattern FROM excludes ORDER BY pattern");
 }
 
 fn globMatch(pat: []const u8, text: []const u8) bool {
@@ -1713,4 +1799,209 @@ test "the log rotates instead of growing without bound" {
     defer testing.allocator.free(current);
     try testing.expect(current.len < log_max_bytes);
     try testing.expect(std.mem.indexOf(u8, current, "after rotation") != null);
+}
+
+// ---------------------------------------------------------------- schema versions and recovery
+
+/// Opens the fixture's database file directly, bypassing `Index.open`.
+fn rawDb(fx: *const Fixture) !sqlite.Db {
+    return sqlite.Db.open(fx.dbPath());
+}
+
+fn dbDirHas(fx: *const Fixture, name: []const u8) bool {
+    return if (fx.db_dir.dir.statFile(testing.io, name, .{})) |_| true else |_| false;
+}
+
+fn expectLastError(idx: *Index, expected: []const u8) !void {
+    var buf: [error_message_max]u8 = undefined;
+    try testing.expectEqualStrings(expected, idx.lastError(&buf));
+}
+
+/// Saves a folder and an exclusion so a test can check that recovery carries them over.
+fn addSettings(idx: *Index, fx: *const Fixture) !void {
+    try idx.addRoot(fx.root());
+    try idx.addExclude("*.log");
+}
+
+fn expectSettingsKept(idx: *Index, fx: *const Fixture) !void {
+    const r = try idx.roots(testing.allocator);
+    defer freeRoots(testing.allocator, r);
+    try testing.expectEqual(@as(usize, 1), r.len);
+    try testing.expectEqualStrings(fx.root(), r[0]);
+    const ex = try idx.excludes(testing.allocator);
+    defer freeRoots(testing.allocator, ex);
+    try testing.expectEqual(@as(usize, 1), ex.len);
+    try testing.expectEqualStrings("*.log", ex[0]);
+}
+
+test "a new database is stamped with the current schema version" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const idx = try fx.open();
+    defer idx.close();
+    try testing.expectEqual(@as(i64, schema_version), try idx.db.userVersion());
+    try expectLastError(idx, "");
+}
+
+test "a database from before versioning keeps its data and is stamped" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    {
+        const db = try rawDb(&fx);
+        defer db.close();
+        try db.exec(migrations[0]);
+        try db.exec("INSERT INTO files(path, name, ext, size, mtime, is_dir, seen) VALUES('/old/a.txt', 'a.txt', 'txt', 3, 0, 0, 1)");
+        try db.exec("INSERT INTO roots(path) VALUES('/old')");
+        try testing.expectEqual(@as(i64, 0), try db.userVersion());
+    }
+    const idx = try fx.open();
+    defer idx.close();
+    try testing.expectEqual(@as(u64, 1), idx.fileCount());
+    try testing.expectEqual(@as(i64, schema_version), try idx.db.userVersion());
+    const r = try idx.roots(testing.allocator);
+    defer freeRoots(testing.allocator, r);
+    try testing.expectEqual(@as(usize, 1), r.len);
+    try expectLastError(idx, "");
+    try testing.expect(!dbDirHas(&fx, "seek.db.corrupt"));
+    const log = try readLog(&fx);
+    defer testing.allocator.free(log);
+    try testing.expect(std.mem.indexOf(u8, log, " info database schema 0 -> ") != null);
+}
+
+test "migrate runs only the pending steps, in order, and is a no-op when current" {
+    const db = try sqlite.Db.open(":memory:");
+    defer db.close();
+    // Re-running step 1 would fail (no IF NOT EXISTS), so this also proves it is skipped.
+    const steps = [_][:0]const u8{ "CREATE TABLE a(x)", "CREATE TABLE b(y); INSERT INTO b SELECT x FROM a" };
+    try db.exec(steps[0]);
+    try db.setUserVersion(1);
+    try testing.expectEqual(@as(i64, 1), try migrate(db, &steps));
+    try testing.expectEqual(@as(i64, 2), try db.userVersion());
+    try testing.expectEqual(@as(i64, 2), try migrate(db, &steps));
+    try db.exec("SELECT y FROM b");
+}
+
+test "a failing migration step rolls back every step and keeps the version" {
+    const db = try sqlite.Db.open(":memory:");
+    defer db.close();
+    const steps = [_][:0]const u8{ "CREATE TABLE a(x)", "NOT SQL" };
+    try testing.expectError(error.SqliteError, migrate(db, &steps));
+    try testing.expectEqual(@as(i64, 0), try db.userVersion());
+    try testing.expectError(error.SqliteError, db.exec("SELECT x FROM a"));
+}
+
+test "migrate refuses a version it doesn't know and changes nothing" {
+    const db = try sqlite.Db.open(":memory:");
+    defer db.close();
+    try db.setUserVersion(schema_version + 1);
+    try testing.expectError(error.UnsupportedSchemaVersion, migrate(db, &migrations));
+    try testing.expectEqual(@as(i64, schema_version + 1), try db.userVersion());
+    try db.setUserVersion(-1);
+    try testing.expectError(error.UnsupportedSchemaVersion, migrate(db, &migrations));
+}
+
+test "a database from a newer Seek is set aside, keeping folders and exclusions" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    {
+        const idx = try fx.open();
+        defer idx.close();
+        try addSettings(idx, &fx);
+        try idx.db.setUserVersion(schema_version + 1);
+    }
+    const idx = try fx.open();
+    defer idx.close();
+    try testing.expect(dbDirHas(&fx, "seek.db.newer"));
+    try testing.expectEqual(@as(i64, schema_version), try idx.db.userVersion());
+    try expectSettingsKept(idx, &fx);
+    try expectLastError(idx, "the index database was unusable and has been replaced: UnsupportedSchemaVersion");
+    // The newer file is kept as it was, for a later upgrade or a bug report.
+    var buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const old = try sqlite.Db.open(try std.fmt.bufPrintSentinel(&buf, "{s}.newer", .{fx.dbPath()}, 0));
+    defer old.close();
+    try testing.expectEqual(@as(i64, schema_version + 1), try old.userVersion());
+}
+
+test "a file that isn't a database is set aside and replaced" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const junk: [8192]u8 = @splat('j');
+    try fx.db_dir.dir.writeFile(testing.io, .{ .sub_path = "seek.db", .data = &junk });
+    try fx.db_dir.dir.writeFile(testing.io, .{ .sub_path = "seek.db-wal", .data = "stale log" });
+
+    const idx = try fx.open();
+    defer idx.close();
+    try testing.expectEqual(@as(u64, 0), idx.fileCount());
+    try testing.expectEqual(@as(i64, schema_version), try idx.db.userVersion());
+    try expectLastError(idx, "the index database was unusable and has been replaced: DatabaseCorrupt");
+    const kept = try fx.db_dir.dir.readFileAlloc(testing.io, "seek.db.corrupt", testing.allocator, .limited(junk.len + 1));
+    defer testing.allocator.free(kept);
+    try testing.expectEqualSlices(u8, &junk, kept);
+    // The stale log is gone (SQLite drops a log it can't use) and didn't leak into the new database.
+    if (fx.db_dir.dir.readFileAlloc(testing.io, "seek.db-wal", testing.allocator, .limited(1 << 20))) |wal| {
+        defer testing.allocator.free(wal);
+        try testing.expect(std.mem.indexOf(u8, wal, "stale log") == null);
+    } else |_| {}
+
+    // The replacement works normally and survives a reopen.
+    try fx.touch("a.txt");
+    _ = try idx.indexRoot(fx.root(), null, null);
+    const log = try readLog(&fx);
+    defer testing.allocator.free(log);
+    try testing.expect(std.mem.indexOf(u8, log, " warn moved the old database to ") != null);
+    try testing.expect(std.mem.indexOf(u8, log, " error the index database was unusable") != null);
+}
+
+test "damage in the files table is recovered, keeping folders and exclusions" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    for (0..50) |i| {
+        var name_buf: [32]u8 = undefined;
+        try fx.touch(try std.fmt.bufPrint(&name_buf, "file{d}.txt", .{i}));
+    }
+    {
+        const idx = try fx.open();
+        defer idx.close();
+        try addSettings(idx, &fx);
+        _ = try idx.indexRoot(fx.root(), null, null);
+    } // closing the last connection folds the write-ahead log into seek.db
+
+    // Overwrite the files table's root page; the roots and excludes pages stay intact.
+    const page_size: usize, const root_page: usize = blk: {
+        const db = try rawDb(&fx);
+        defer db.close();
+        const st = try db.prepare("SELECT (SELECT page_size FROM pragma_page_size), rootpage FROM sqlite_schema WHERE name = 'files'");
+        defer st.finalize();
+        try testing.expect(try st.step());
+        break :blk .{ @intCast(st.int(0)), @intCast(st.int(1)) };
+    };
+    const bytes = try fx.db_dir.dir.readFileAlloc(testing.io, "seek.db", testing.allocator, .unlimited);
+    defer testing.allocator.free(bytes);
+    @memset(bytes[(root_page - 1) * page_size ..][0..page_size], 0xff);
+    try fx.db_dir.dir.writeFile(testing.io, .{ .sub_path = "seek.db", .data = bytes });
+
+    const idx = try fx.open();
+    defer idx.close();
+    try testing.expect(dbDirHas(&fx, "seek.db.corrupt"));
+    try expectSettingsKept(idx, &fx);
+    try expectLastError(idx, "the index database was unusable and has been replaced: DatabaseCorrupt");
+    // The saved folder is still known, so the next rescan refills the index.
+    try testing.expectEqual(@as(u64, 0), idx.fileCount());
+    try testing.expectEqual(@as(u64, 50), try idx.reindexAll(null, null));
+}
+
+test "an unreadable in-memory or missing database is an error, not a recovery" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const idx = try Index.open(testing.allocator, testing.io, ":memory:");
+    defer idx.close();
+    try testing.expectError(error.DatabaseCorrupt, idx.recover(":memory:", error.DatabaseCorrupt));
+    try testing.expectError(error.DatabaseCorrupt, idx.recover(fx.dbPath(), error.DatabaseCorrupt));
+    try testing.expect(!dbDirHas(&fx, "seek.db.corrupt"));
 }

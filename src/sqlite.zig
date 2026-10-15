@@ -7,8 +7,11 @@ pub const c_db = opaque {};
 pub const c_stmt = opaque {};
 
 const OK = 0;
+const CORRUPT = 11;
+const NOTADB = 26;
 const ROW = 100;
 const DONE = 101;
+const OPEN_READONLY = 0x00000001;
 const OPEN_READWRITE = 0x00000002;
 const OPEN_CREATE = 0x00000004;
 const OPEN_FULLMUTEX = 0x00010000;
@@ -27,14 +30,33 @@ extern "c" fn sqlite3_column_text(stmt: *c_stmt, col: c_int) ?[*]const u8;
 extern "c" fn sqlite3_column_bytes(stmt: *c_stmt, col: c_int) c_int;
 extern "c" fn sqlite3_errmsg(db: *c_db) [*:0]const u8;
 
-pub const Error = error{SqliteError};
+/// `DatabaseCorrupt` means the file is damaged or isn't a database at all (SQLITE_CORRUPT,
+/// SQLITE_NOTADB); every other failure is `SqliteError`.
+pub const Error = error{ SqliteError, DatabaseCorrupt };
+
+fn check(rc: c_int) Error!void {
+    return switch (rc & 0xff) { // the low byte is the primary code, even for extended codes
+        OK => {},
+        CORRUPT, NOTADB => error.DatabaseCorrupt,
+        else => error.SqliteError,
+    };
+}
 
 pub const Db = struct {
     handle: *c_db,
 
     pub fn open(path: [:0]const u8) Error!Db {
+        return openFlags(path, OPEN_READWRITE | OPEN_CREATE | OPEN_FULLMUTEX);
+    }
+
+    /// Opens an existing database without creating it or allowing writes.
+    pub fn openReadOnly(path: [:0]const u8) Error!Db {
+        return openFlags(path, OPEN_READONLY | OPEN_FULLMUTEX);
+    }
+
+    fn openFlags(path: [:0]const u8, flags: c_int) Error!Db {
         var h: ?*c_db = null;
-        const rc = sqlite3_open_v2(path.ptr, &h, OPEN_READWRITE | OPEN_CREATE | OPEN_FULLMUTEX, null);
+        const rc = sqlite3_open_v2(path.ptr, &h, flags, null);
         if (rc != OK or h == null) {
             _ = sqlite3_close_v2(h);
             return error.SqliteError;
@@ -47,14 +69,27 @@ pub const Db = struct {
     }
 
     pub fn exec(db: Db, sql: [:0]const u8) Error!void {
-        if (sqlite3_exec(db.handle, sql.ptr, null, null, null) != OK) return error.SqliteError;
+        try check(sqlite3_exec(db.handle, sql.ptr, null, null, null));
     }
 
     pub fn prepare(db: Db, sql: []const u8) Error!Stmt {
         var s: ?*c_stmt = null;
-        if (sqlite3_prepare_v2(db.handle, sql.ptr, @intCast(sql.len), &s, null) != OK or s == null)
-            return error.SqliteError;
-        return .{ .handle = s.? };
+        try check(sqlite3_prepare_v2(db.handle, sql.ptr, @intCast(sql.len), &s, null));
+        return .{ .handle = s orelse return error.SqliteError };
+    }
+
+    /// `PRAGMA user_version`: a number SQLite stores for the application, 0 in a new database.
+    pub fn userVersion(db: Db) Error!i64 {
+        const st = try db.prepare("PRAGMA user_version");
+        defer st.finalize();
+        if (!try st.step()) return error.SqliteError;
+        return st.int(0);
+    }
+
+    pub fn setUserVersion(db: Db, v: i32) Error!void {
+        var buf: [48]u8 = undefined;
+        const sql = std.fmt.bufPrintSentinel(&buf, "PRAGMA user_version = {d}", .{v}, 0) catch return error.SqliteError;
+        try db.exec(sql);
     }
 
     pub fn errmsg(db: Db) []const u8 {
@@ -79,7 +114,10 @@ pub const Stmt = struct {
         return switch (sqlite3_step(s.handle)) {
             ROW => true,
             DONE => false,
-            else => error.SqliteError,
+            else => |rc| {
+                try check(rc);
+                return error.SqliteError; // OK is not a valid step result
+            },
         };
     }
 
@@ -152,6 +190,30 @@ test "bad SQL and constraint violations are errors, not crashes" {
     st.reset();
     try st.bindText(1, "same");
     try std.testing.expectError(error.SqliteError, st.step());
+}
+
+test "user_version starts at 0 and round-trips" {
+    const db = try Db.open(":memory:");
+    defer db.close();
+    try std.testing.expectEqual(@as(i64, 0), try db.userVersion());
+    try db.setUserVersion(7);
+    try std.testing.expectEqual(@as(i64, 7), try db.userVersion());
+}
+
+test "a file that isn't a database reports DatabaseCorrupt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const junk: [4096]u8 = @splat('j');
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "junk.db", .data = &junk });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &buf);
+    var path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/junk.db", .{buf[0..n]}, 0);
+
+    const db = try Db.open(path); // opening is lazy; the first read finds the damage
+    defer db.close();
+    try std.testing.expectError(error.DatabaseCorrupt, db.exec("SELECT * FROM sqlite_schema"));
+    try std.testing.expectError(error.DatabaseCorrupt, db.prepare("SELECT * FROM sqlite_schema"));
 }
 
 test "opening an unreachable path fails" {

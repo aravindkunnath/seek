@@ -24,7 +24,10 @@ typedef struct {
 typedef void (*seek_progress_fn)(void *ctx, uint64_t files_seen);
 
 /* Opens (or creates) the index. db_path may be NULL for the default location
- * ($SEEK_DB, else ~/Library/Application Support/Seek/seek.db on macOS). */
+ * ($SEEK_DB, else ~/Library/Application Support/Seek/seek.db on macOS). An older database is
+ * upgraded in place. One that is damaged, or was written by a newer Seek, is renamed to
+ * seek.db.corrupt / seek.db.newer and replaced by an empty index that keeps the saved folders and
+ * exclusions it could still read; seek_last_error then says so, and the next rescan refills it. */
 seek_index *seek_open(const char *db_path);
 void seek_close(seek_index *idx);
 
