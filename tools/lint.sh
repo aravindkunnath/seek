@@ -9,7 +9,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-ZIG=$(ls src/*.zig build.zig tests/*.zig 2>/dev/null)
+ZIG=$(ls src/*.zig build.zig tests/*.zig tools/*.zig 2>/dev/null)
 OBJC=$(ls macos/*.m macos/*.h 2>/dev/null)
 CSRC=$(ls tests/*.c include/*.h 2>/dev/null)
 ALL="$ZIG $OBJC $CSRC"

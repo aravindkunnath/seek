@@ -7,6 +7,10 @@
 //! zig build check      → fmt-check + lint + objc-check + test + netcheck   (run before every commit)
 //! zig build check-deep → check + tests in ReleaseSafe + tests under ThreadSanitizer
 //! zig build fmt        → rewrite Zig sources into canonical format
+//!
+//! zig build bench      → scale benchmark: a generated 1,000,000-entry tree, scan and search
+//!                        timings, memory, checked against the budgets in docs/benchmarks.md
+//!                        (-Dbench-entries=N for a smaller tree, `zig build bench-clean` to delete it)
 
 const std = @import("std");
 
@@ -49,13 +53,34 @@ pub fn build(b: *std.Build) void {
     // ---- tests
     const test_step = b.step("test", "Run unit tests and the C API test");
     test_step.dependOn(addTestSuite(b, "suite", target, optimize, false));
+
+    // ---- scale benchmark (tools/bench.zig): always ReleaseFast, whatever -Doptimize says,
+    // because the numbers are compared against budgets.
+    const bench_entries = b.option(u64, "bench-entries", "Entries in the benchmark tree (default: 1000000)") orelse 1_000_000;
+    const bench_enforce = b.option(bool, "bench-enforce", "Fail `zig build bench` when a budget is not met") orelse false;
+    const bench_exe = b.addExecutable(.{ .name = "seek-bench", .root_module = benchModule(b, target, .ReleaseFast) });
+    const bench_dir = ".zig-cache/seek-bench"; // run steps start in the project folder
+    const bench_scan = b.addRunArtifact(bench_exe);
+    bench_scan.addArgs(&.{ "scan", "--dir", bench_dir, "--entries", b.fmt("{d}", .{bench_entries}) });
+    if (bench_enforce) bench_scan.addArg("--enforce");
+    // A second process, so idle memory is what a freshly launched Seek holds, not what a scan left.
+    const bench_search = b.addRunArtifact(bench_exe);
+    bench_search.addArgs(&.{ "search", "--dir", bench_dir });
+    if (bench_enforce) bench_search.addArg("--enforce");
+    bench_search.step.dependOn(&bench_scan.step);
+    b.step("bench", "Benchmark scan and search on a generated tree (default: 1,000,000 entries)").dependOn(&bench_search.step);
+    const bench_clean = b.addRunArtifact(bench_exe);
+    bench_clean.addArgs(&.{ "clean", "--dir", bench_dir });
+    b.step("bench-clean", "Delete the benchmark tree and database").dependOn(&bench_clean.step);
+    // The benchmark's own tests (its tree generator and statistics) run with the others.
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = benchModule(b, target, optimize) })).step);
     const safe_step = b.step("test-safe", "Run the tests in ReleaseSafe (runtime safety checks on)");
     safe_step.dependOn(addTestSuite(b, "suite-safe", target, .ReleaseSafe, false));
     const tsan_step = b.step("test-tsan", "Run the tests under ThreadSanitizer (search and scan run concurrently)");
     tsan_step.dependOn(addTestSuite(b, "suite-tsan", target, optimize, true));
 
     // ---- formatting and lint
-    const fmt_paths: []const std.Build.LazyPath = &.{ b.path("src"), b.path("build.zig"), b.path("build.zig.zon") };
+    const fmt_paths: []const std.Build.LazyPath = &.{ b.path("src"), b.path("tools"), b.path("build.zig"), b.path("build.zig.zon") };
     const fmt_step = b.step("fmt", "Rewrite Zig sources into canonical format");
     fmt_step.dependOn(&b.addFmt(.{ .paths = fmt_paths }).step);
     const fmt_check = b.step("fmt-check", "Fail if any Zig source is not formatted");
@@ -183,6 +208,24 @@ fn addTestSuite(b: *std.Build, name: []const u8, target: std.Build.ResolvedTarge
     group.dependOn(&unit.step);
     group.dependOn(&ctest.step);
     return group;
+}
+
+/// tools/bench.zig with the core available as `@import("Index")`.
+fn benchModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const index_mod = b.createModule(.{
+        .root_source_file = b.path("src/Index.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addSqlite(b, index_mod);
+    return b.createModule(.{
+        .root_source_file = b.path("tools/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "Index", .module = index_mod }},
+    });
 }
 
 /// Compiles the vendored SQLite amalgamation (vendor/sqlite) into `mod`, so Seek
