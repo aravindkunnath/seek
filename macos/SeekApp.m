@@ -1622,7 +1622,7 @@ static OSStatus OnHotKey(EventHandlerCallRef next, EventRef event, void *userDat
     NSArray<SeekChip *> *_chips;
     NSMutableSet<NSString *> *_thumbsPending;
     NSString *_detailPath;
-    NSMutableDictionary<NSString *, NSDictionary *> *_facts;
+    NSCache<NSString *, NSDictionary *> *_facts; // bounded: one entry per file ever selected otherwise
     SeekChip *_clearChip;
     NSBox *_chipsDivider;
     NSBox *_footerDivider;
@@ -2137,7 +2137,7 @@ static OSStatus OnHotKey(EventHandlerCallRef next, EventRef event, void *userDat
 
 // Cached by path + modification time so arrowing back and forth is instant.
 - (void)applyDetailFacts:(SeekItem *)it {
-    NSDictionary *facts = _facts[[self factsKeyFor:it]];
+    NSDictionary *facts = [_facts objectForKey:[self factsKeyFor:it]];
     if (!facts) return;
     [_detail setExtras:facts[@"extras"]];
     if (facts[@"dup"]) [_detail setDuplicates:facts[@"dup"] found:[facts[@"found"] boolValue]];
@@ -2148,9 +2148,12 @@ static OSStatus OnHotKey(EventHandlerCallRef next, EventRef event, void *userDat
 }
 
 - (void)loadFactsFor:(SeekItem *)it {
-    if (!_facts) _facts = [NSMutableDictionary dictionary];
+    if (!_facts) {
+        _facts = [NSCache new];
+        _facts.countLimit = 500;
+    }
     NSString *key = [self factsKeyFor:it];
-    if (_facts[key]) {
+    if ([_facts objectForKey:key]) {
         [self applyDetailFacts:it];
         return;
     }
@@ -2161,9 +2164,9 @@ static OSStatus OnHotKey(EventHandlerCallRef next, EventRef event, void *userDat
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSArray *extras = ExtraDetails(it);
         dispatch_async(dispatch_get_main_queue(), ^{
-            NSMutableDictionary *f = [self->_facts[key] mutableCopy] ?: [NSMutableDictionary dictionary];
+            NSMutableDictionary *f = [[self->_facts objectForKey:key] mutableCopy] ?: [NSMutableDictionary dictionary];
             f[@"extras"] = extras;
-            self->_facts[key] = f;
+            [self->_facts setObject:f forKey:key];
             if ([self->_detailPath isEqualToString:it.path]) [self->_detail setExtras:extras];
         });
     });
@@ -2200,10 +2203,10 @@ static OSStatus OnHotKey(EventHandlerCallRef next, EventRef event, void *userDat
                                          : [NSString stringWithFormat:@"%lu other copies", (unsigned long)copies.count];
             }
             dispatch_async(dispatch_get_main_queue(), ^{
-                NSMutableDictionary *f = [self->_facts[key] mutableCopy] ?: [NSMutableDictionary dictionary];
+                NSMutableDictionary *f = [[self->_facts objectForKey:key] mutableCopy] ?: [NSMutableDictionary dictionary];
                 f[@"dup"] = text;
                 f[@"found"] = @(copies.count > 0);
-                self->_facts[key] = f;
+                [self->_facts setObject:f forKey:key];
                 if ([self->_detailPath isEqualToString:it.path]) [self->_detail setDuplicates:text found:copies.count > 0];
             });
         });
@@ -2286,7 +2289,9 @@ static OSStatus OnHotKey(EventHandlerCallRef next, EventRef event, void *userDat
                            completionHandler:^(QLThumbnailRepresentation *rep, NSError *err) {
             NSImage *src = rep.NSImage;
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (!src) return; // keep the badge
+                if (!src) return; // keep the badge, and stay pending so a file with no thumbnail isn't asked for again
+                // Done: if the cache later drops this thumbnail, it can be requested again.
+                [self->_thumbsPending removeObject:path];
                 NSSize sz = src.size;
                 NSImage *rounded = [NSImage imageWithSize:sz flipped:NO drawingHandler:^BOOL(NSRect r) {
                     [[NSBezierPath bezierPathWithRoundedRect:r xRadius:6 yRadius:6] addClip];

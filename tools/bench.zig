@@ -418,7 +418,6 @@ fn runSearch(gpa: Allocator, arena: Allocator, io: Io, out: *Io.Writer, opts: Op
 
     try out.print("search ({d} entries, {d} runs per query)\n", .{ entries, opts.reps });
     try out.print("  open and load          {d:>10.2} s\n", .{ms(open_ns) / 1000});
-    if (footprintBytes()) |b| try out.print("  memory after loading   {d:>10.1} MB\n", .{mb(b)});
 
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
@@ -446,8 +445,7 @@ fn runSearch(gpa: Allocator, arena: Allocator, io: Io, out: *Io.Writer, opts: Op
             class.label, ms(percentile(samples.items, 50)), ms(p99), ms(samples.items[samples.items.len - 1]),
         });
     }
-    // Measured after the searches, not straight after loading: the system only charges for the
-    // snapshot's pages once they have been read, and an app that has been used has read them all.
+    // Measured after the searches, so it includes whatever searching leaves behind.
     const idle = footprintBytes();
     if (idle) |b| try out.print("  idle memory            {d:>10.1} MB   (after searching)\n", .{mb(b)});
     try out.print("  peak memory            {d:>10.1} MB\n", .{mb(peakBytes())});

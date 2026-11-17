@@ -2,7 +2,8 @@
 //! of every path serves as-you-type filename search.
 //!
 //! Thread safety: `search` and `indexRoot` may run on different threads.
-//! Indexing is serialized by `db_mutex`; the snapshot swap is guarded by `mem_mutex`.
+//! Indexing is serialized by `db_mutex`. The snapshot is changed only while holding both
+//! `db_mutex` and `mem_mutex`, so it may be read while holding either one.
 
 const std = @import("std");
 const Io = std.Io;
@@ -60,19 +61,77 @@ pub const Entry = struct {
 };
 
 const Snapshot = struct {
-    buf: []u8 = &.{},
-    entries: []Entry = &.{},
+    /// Every path, each followed by a NUL.
+    buf: std.ArrayList(u8) = .empty,
+    entries: std.ArrayList(Entry) = .empty,
+    /// Bytes of `buf` that belonged to removed entries; `compact` takes them back.
+    dead_bytes: usize = 0,
 
     fn deinit(s: *Snapshot, gpa: Allocator) void {
-        gpa.free(s.buf);
-        gpa.free(s.entries);
+        s.buf.deinit(gpa);
+        s.entries.deinit(gpa);
         s.* = .{};
     }
 
     pub fn path(s: *const Snapshot, e: Entry) []const u8 {
-        return s.buf[e.off..][0..e.len];
+        return s.buf.items[e.off..][0..e.len];
+    }
+
+    /// Adds an entry. Returns false, adding nothing, for a path the snapshot can't hold:
+    /// empty, longer than 65,535 bytes, or past 4 GB of paths in total.
+    fn append(s: *Snapshot, gpa: Allocator, p: []const u8, size: u64, mtime: i64, is_dir: bool) !bool {
+        if (p.len == 0 or p.len > std.math.maxInt(u16)) return false;
+        const off = s.buf.items.len;
+        if (off + p.len + 1 > std.math.maxInt(u32)) return false;
+        try s.buf.ensureUnusedCapacity(gpa, p.len + 1);
+        try s.entries.ensureUnusedCapacity(gpa, 1);
+        s.buf.appendSliceAssumeCapacity(p);
+        s.buf.appendAssumeCapacity(0);
+        const name_off: u32 = if (std.mem.findScalarLast(u8, p, '/')) |slash| @intCast(slash + 1) else 0;
+        s.entries.appendAssumeCapacity(.{
+            .off = @intCast(off),
+            .len = @intCast(p.len),
+            .name_off = name_off,
+            .path_mask = fuzzy.charMask(p),
+            .name_mask = fuzzy.charMask(p[name_off..]),
+            .is_dir = is_dir,
+            .size = size,
+            .mtime = mtime,
+        });
+        return true;
+    }
+
+    /// Removes entry `i` by moving the last entry into its place, so only indexes at or
+    /// after `i` change meaning.
+    fn removeAt(s: *Snapshot, i: usize) void {
+        s.dead_bytes += s.entries.items[i].len + 1;
+        _ = s.entries.swapRemove(i);
+    }
+
+    /// True when removed entries hold more than half of the path bytes.
+    fn wantsCompaction(s: *const Snapshot) bool {
+        return s.dead_bytes * 2 > s.buf.items.len;
+    }
+
+    /// Rewrites `buf` with only the paths still in use. On failure nothing has changed.
+    fn compact(s: *Snapshot, gpa: Allocator) !void {
+        var fresh: std.ArrayList(u8) = try .initCapacity(gpa, s.buf.items.len - s.dead_bytes);
+        for (s.entries.items) |*e| {
+            const off = fresh.items.len;
+            fresh.appendSliceAssumeCapacity(s.buf.items[e.off..][0 .. e.len + 1]);
+            e.off = @intCast(off);
+        }
+        s.buf.deinit(gpa);
+        s.buf = fresh;
+        s.dead_bytes = 0;
     }
 };
+
+/// Whether `p` lies below the folder `root` (which has no trailing slash, unless it is "/").
+fn isUnder(root: []const u8, p: []const u8) bool {
+    if (std.mem.eql(u8, root, "/")) return p.len > 1;
+    return p.len > root.len and p[root.len] == '/' and std.mem.startsWith(u8, p, root);
+}
 
 pub const Hit = struct {
     path: []const u8, // borrowed; valid only while the caller holds the result arena
@@ -499,9 +558,8 @@ pub fn rootFileCount(self: *Index, root_in: []const u8) u64 {
     defer self.mem_mutex.unlock(self.io);
     const snap = &self.snap;
     var n: u64 = 0;
-    for (snap.entries) |e| {
-        const p = snap.path(e);
-        if (std.mem.eql(u8, root, "/") or (p.len > root.len and p[root.len] == '/' and std.mem.startsWith(u8, p, root))) n += 1;
+    for (snap.entries.items) |e| {
+        if (isUnder(root, snap.path(e))) n += 1;
     }
     return n;
 }
@@ -591,11 +649,136 @@ fn extOf(name: []const u8) []const u8 {
     return name[dot + 1 ..];
 }
 
-/// Scans `root` (absolute) into the database, removes rows for files that no
-/// longer exist under it, then refreshes the in-memory snapshot.
-/// Returns the number of entries seen.
+/// One difference between the disk and the index, found by a scan and not yet applied.
+const Change = struct {
+    off: u32, // path, in `Changes.text`
+    len: u32,
+    size: u64,
+    mtime: i64,
+    is_dir: bool,
+    /// The snapshot entry this updates; null for a path the index doesn't have yet.
+    at: ?u32,
+};
+
+const Changes = struct {
+    text: std.ArrayList(u8) = .empty,
+    items: std.ArrayList(Change) = .empty,
+
+    /// Applied to the index whenever this many have piled up, which bounds a scan's memory and
+    /// lets a first scan's results show up while it is still running.
+    const batch = 20_000;
+
+    fn deinit(c: *Changes, gpa: Allocator) void {
+        c.text.deinit(gpa);
+        c.items.deinit(gpa);
+    }
+
+    fn add(c: *Changes, gpa: Allocator, p: []const u8, size: u64, mtime: i64, is_dir: bool, at: ?u32) !void {
+        try c.items.append(gpa, .{ .off = @intCast(c.text.items.len), .len = @intCast(p.len), .size = size, .mtime = mtime, .is_dir = is_dir, .at = at });
+        try c.text.appendSlice(gpa, p);
+    }
+
+    fn path(c: *const Changes, ch: Change) []const u8 {
+        return c.text.items[ch.off..][0..ch.len];
+    }
+};
+
+/// Writes `changes` to the database in one transaction, then makes the same changes to the
+/// snapshot, and empties the list. Caller holds db_mutex. If the database write fails the
+/// snapshot is left as it was. If the snapshot runs out of memory part-way it is missing
+/// entries the database has; the next scan sees them as new and puts them back.
+fn applyChanges(self: *Index, changes: *Changes) !void {
+    if (changes.items.items.len == 0) return;
+    const db = self.db;
+    {
+        const upsert = try db.prepare(
+            \\INSERT INTO files(path, name, ext, size, mtime, is_dir, seen) VALUES(?, ?, ?, ?, ?, ?, 0)
+            \\ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime, is_dir=excluded.is_dir
+        );
+        defer upsert.finalize();
+        try db.exec("BEGIN");
+        var committed = false;
+        defer if (!committed) self.rollback();
+        var ext_buf: [32]u8 = undefined;
+        for (changes.items.items) |ch| {
+            const p = changes.path(ch);
+            const name = if (std.mem.findScalarLast(u8, p, '/')) |slash| p[slash + 1 ..] else p;
+            const ext_raw = extOf(name);
+            upsert.reset();
+            try upsert.bindText(1, p);
+            try upsert.bindText(2, name);
+            try upsert.bindText(3, std.ascii.lowerString(&ext_buf, ext_raw[0..@min(ext_raw.len, ext_buf.len)]));
+            try upsert.bindInt(4, @intCast(ch.size));
+            try upsert.bindInt(5, ch.mtime);
+            try upsert.bindInt(6, @intFromBool(ch.is_dir));
+            _ = try upsert.step();
+        }
+        try db.exec("COMMIT");
+        committed = true;
+    }
+
+    self.mem_mutex.lockUncancelable(self.io);
+    defer self.mem_mutex.unlock(self.io);
+    for (changes.items.items) |ch| {
+        if (ch.at) |i| {
+            const e = &self.snap.entries.items[i];
+            e.size = ch.size;
+            e.mtime = ch.mtime;
+            e.is_dir = ch.is_dir;
+        } else {
+            _ = try self.snap.append(self.gpa, changes.path(ch), ch.size, ch.mtime, ch.is_dir);
+        }
+    }
+    changes.items.clearRetainingCapacity();
+    changes.text.clearRetainingCapacity();
+}
+
+/// Abandons the open transaction. If even that fails, SQLite drops the transaction when the
+/// connection closes; all that is left to do is say so.
+fn rollback(self: *Index) void {
+    self.db.exec("ROLLBACK") catch |err| self.logf("warn", "rollback failed: {t} ({s})", .{ err, self.db.errmsg() });
+}
+
+/// Removes from the database and the snapshot every entry whose bit in `keep` is clear.
+/// `keep` covers the entries the snapshot had when the scan began. Caller holds db_mutex.
+fn removeMissing(self: *Index, keep: *const std.DynamicBitSetUnmanaged) !void {
+    const missing = keep.bit_length - keep.count();
+    if (missing == 0) return;
+    const db = self.db;
+    {
+        const del = try db.prepare("DELETE FROM files WHERE path = ?");
+        defer del.finalize();
+        try db.exec("BEGIN");
+        var committed = false;
+        defer if (!committed) self.rollback();
+        var gone = keep.iterator(.{ .kind = .unset });
+        while (gone.next()) |i| {
+            del.reset();
+            try del.bindText(1, self.snap.path(self.snap.entries.items[i]));
+            _ = try del.step();
+        }
+        try db.exec("COMMIT");
+        committed = true;
+    }
+
+    self.mem_mutex.lockUncancelable(self.io);
+    defer self.mem_mutex.unlock(self.io);
+    // Highest index first: each removal moves the last entry down, and everything above the
+    // one being removed has already been decided.
+    var gone = keep.iterator(.{ .kind = .unset, .direction = .reverse });
+    while (gone.next()) |i| self.snap.removeAt(i);
+    if (self.snap.wantsCompaction()) {
+        self.snap.compact(self.gpa) catch |err| self.logf("warn", "could not compact the snapshot: {t}", .{err});
+    }
+}
+
+/// Scans `root` (absolute) and brings the index in line with it: entries that are new or have
+/// a different size, time or kind are written, entries no longer on disk are removed, and
+/// everything else is left untouched, in the database and in memory. A scan that finds nothing
+/// changed writes nothing. Returns the number of entries seen.
 pub fn indexRoot(self: *Index, root_in: []const u8, progress: ?ProgressFn, ctx: ?*anyopaque) !u64 {
     const io = self.io;
+    const gpa = self.gpa;
     const root = trimSlash(root_in);
     const home = if (std.c.getenv("HOME")) |h| trimSlash(std.mem.span(h)) else "";
     const root_is_home = home.len > 0 and std.mem.eql(u8, root, home);
@@ -605,35 +788,39 @@ pub fn indexRoot(self: *Index, root_in: []const u8, progress: ?ProgressFn, ctx: 
 
     self.db_mutex.lockUncancelable(io);
     defer self.db_mutex.unlock(io);
-    const db = self.db;
 
-    const user_ex = try self.excludesLocked(self.gpa);
-    defer freeRoots(self.gpa, user_ex);
+    const user_ex = try self.excludesLocked(gpa);
+    defer freeRoots(gpa, user_ex);
 
-    const scan_id: i64 = blk: {
-        const st = try db.prepare("SELECT COALESCE(MAX(seen), 0) + 1 FROM files");
-        defer st.finalize();
-        _ = try st.step();
-        break :blk st.int(0);
-    };
+    // What the index holds under this root now: path -> entry number. Holding db_mutex keeps
+    // the entries where they are until this scan itself removes some, which it does last.
+    // Both lookups are sized once and come straight from the system, so the memory goes back
+    // the moment the scan ends instead of sitting in the allocator's cache of freed blocks.
+    const scratch = std.heap.page_allocator;
+    const snap = &self.snap;
+    const known_count = snap.entries.items.len;
+    var known: std.HashMapUnmanaged(u32, u32, std.hash_map.StringIndexContext, std.hash_map.default_max_load_percentage) = .empty;
+    defer known.deinit(scratch);
+    const by_offset: std.hash_map.StringIndexContext = .{ .bytes = &snap.buf };
+    const by_text: std.hash_map.StringIndexAdapter = .{ .bytes = &snap.buf };
+    try known.ensureTotalCapacityContext(scratch, @intCast(known_count), by_offset);
+    // A clear bit at the end of the walk means "under this root and not found on disk".
+    var keep: std.DynamicBitSetUnmanaged = try .initEmpty(scratch, known_count);
+    defer keep.deinit(scratch);
+    for (snap.entries.items, 0..) |e, i| {
+        if (isUnder(root, snap.path(e))) {
+            known.putAssumeCapacityContext(e.off, @intCast(i), by_offset);
+        } else keep.set(i);
+    }
 
-    const upsert = try db.prepare(
-        \\INSERT INTO files(path, name, ext, size, mtime, is_dir, seen) VALUES(?, ?, ?, ?, ?, ?, ?)
-        \\ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime,
-        \\  is_dir=excluded.is_dir, seen=excluded.seen
-    );
-    defer upsert.finalize();
+    var changes: Changes = .{};
+    defer changes.deinit(gpa);
 
-    try db.exec("BEGIN");
-    var committed = false;
-    defer if (!committed) db.exec("ROLLBACK") catch {};
-
-    var walker = try dir.walkSelectively(self.gpa);
+    var walker = try dir.walkSelectively(gpa);
     defer walker.deinit();
 
     var full: std.ArrayList(u8) = .empty;
-    defer full.deinit(self.gpa);
-    var ext_buf: [32]u8 = undefined;
+    defer full.deinit(gpa);
     var count: u64 = 0;
 
     while (true) {
@@ -641,9 +828,9 @@ pub fn indexRoot(self: *Index, root_in: []const u8, progress: ?ProgressFn, ctx: 
         const name = entry.basename;
         if (isExcluded(name)) continue;
         full.clearRetainingCapacity();
-        try full.appendSlice(self.gpa, if (std.mem.eql(u8, root, "/")) "" else root);
-        try full.append(self.gpa, '/');
-        try full.appendSlice(self.gpa, entry.path);
+        try full.appendSlice(gpa, if (std.mem.eql(u8, root, "/")) "" else root);
+        try full.append(gpa, '/');
+        try full.appendSlice(gpa, entry.path);
         if (user_ex.len > 0 and userExcluded(user_ex, name, full.items)) continue;
         if (root_is_home and entry.depth() == 1) {
             var skip = false;
@@ -663,52 +850,29 @@ pub fn indexRoot(self: *Index, root_in: []const u8, progress: ?ProgressFn, ctx: 
             mtime = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
         } else |_| {}
 
-        const ext_raw = extOf(name);
-        const ext = std.ascii.lowerString(&ext_buf, ext_raw[0..@min(ext_raw.len, ext_buf.len)]);
-
-        upsert.reset();
-        try upsert.bindText(1, full.items);
-        try upsert.bindText(2, name);
-        try upsert.bindText(3, ext);
-        try upsert.bindInt(4, @intCast(size));
-        try upsert.bindInt(5, mtime);
-        try upsert.bindInt(6, @intFromBool(is_dir));
-        try upsert.bindInt(7, scan_id);
-        _ = try upsert.step();
+        if (known.getAdapted(@as([]const u8, full.items), by_text)) |i| {
+            keep.set(i);
+            const e = snap.entries.items[i];
+            if (e.size != size or e.mtime != mtime or e.is_dir != is_dir) try changes.add(gpa, full.items, size, mtime, is_dir, i);
+        } else {
+            try changes.add(gpa, full.items, size, mtime, is_dir, null);
+        }
+        if (changes.items.items.len >= Changes.batch) try self.applyChanges(&changes);
 
         count += 1;
-        if (count % 20_000 == 0) {
-            try db.exec("COMMIT");
-            try db.exec("BEGIN");
-        }
         if (progress) |cb| if (count % 5_000 == 0) cb(ctx, count);
     }
 
-    // Drop rows under this root that weren't seen in this scan (deleted files).
-    // Range [root/, root0) covers every path below root ('0' follows '/').
+    try self.applyChanges(&changes);
+    try self.removeMissing(&keep);
     {
-        const lo = try std.fmt.allocPrint(self.gpa, "{s}/", .{root});
-        defer self.gpa.free(lo);
-        const hi = try std.fmt.allocPrint(self.gpa, "{s}0", .{root});
-        defer self.gpa.free(hi);
-        const del = try db.prepare("DELETE FROM files WHERE path >= ? AND path < ? AND seen <> ?");
-        defer del.finalize();
-        try del.bindText(1, lo);
-        try del.bindText(2, hi);
-        try del.bindInt(3, scan_id);
-        _ = try del.step();
-    }
-    {
-        const st = try db.prepare("INSERT OR IGNORE INTO roots(path) VALUES(?)");
+        const st = try self.db.prepare("INSERT OR IGNORE INTO roots(path) VALUES(?)");
         defer st.finalize();
         try st.bindText(1, root);
         _ = try st.step();
     }
-    try db.exec("COMMIT");
-    committed = true;
     if (progress) |cb| cb(ctx, count);
 
-    try self.reloadLocked();
     self.logf("info", "scanned {s}: {d} entries", .{ root, count });
     return count;
 }
@@ -746,37 +910,28 @@ pub fn reload(self: *Index) !void {
 /// Builds a fresh snapshot from SQLite and swaps it in. Caller holds db_mutex.
 fn reloadLocked(self: *Index) !void {
     const gpa = self.gpa;
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(gpa);
-    var entries: std.ArrayList(Entry) = .empty;
-    errdefer entries.deinit(gpa);
+    var fresh: Snapshot = .{};
+    errdefer fresh.deinit(gpa);
+
+    // Size both buffers exactly before filling them. Growing them as rows arrive leaves up to
+    // half again as much memory allocated and already written to, which the process keeps.
+    {
+        const sizes = try self.db.prepare("SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(path AS BLOB))), 0) FROM files");
+        defer sizes.finalize();
+        if (try sizes.step()) {
+            const rows: usize = @intCast(@max(sizes.int(0), 0));
+            const path_bytes: usize = @intCast(@max(sizes.int(1), 0));
+            try fresh.entries.ensureTotalCapacityPrecise(gpa, rows);
+            try fresh.buf.ensureTotalCapacityPrecise(gpa, @min(path_bytes + rows, std.math.maxInt(u32)));
+        }
+    }
 
     const st = try self.db.prepare("SELECT path, size, mtime, is_dir FROM files");
     defer st.finalize();
     while (try st.step()) {
-        const p = st.text(0);
-        if (p.len == 0 or p.len > std.math.maxInt(u16)) continue;
-        const off = buf.items.len;
-        if (off + p.len + 1 > std.math.maxInt(u32)) break; // >4 GB of paths: stop growing
-        try buf.appendSlice(gpa, p);
-        try buf.append(gpa, 0);
-        const name_off: u32 = if (std.mem.findScalarLast(u8, p, '/')) |s| @intCast(s + 1) else 0;
-        try entries.append(gpa, .{
-            .off = @intCast(off),
-            .len = @intCast(p.len),
-            .name_off = name_off,
-            .path_mask = fuzzy.charMask(p),
-            .name_mask = fuzzy.charMask(p[name_off..]),
-            .is_dir = st.int(3) != 0,
-            .size = @intCast(@max(st.int(1), 0)),
-            .mtime = st.int(2),
-        });
+        _ = try fresh.append(gpa, st.text(0), @intCast(@max(st.int(1), 0)), st.int(2), st.int(3) != 0);
     }
 
-    var fresh: Snapshot = .{
-        .buf = try buf.toOwnedSlice(gpa),
-        .entries = try entries.toOwnedSlice(gpa),
-    };
     self.mem_mutex.lockUncancelable(self.io);
     std.mem.swap(Snapshot, &self.snap, &fresh);
     self.mem_mutex.unlock(self.io);
@@ -786,7 +941,7 @@ fn reloadLocked(self: *Index) !void {
 pub fn fileCount(self: *Index) u64 {
     self.mem_mutex.lockUncancelable(self.io);
     defer self.mem_mutex.unlock(self.io);
-    return self.snap.entries.len;
+    return self.snap.entries.items.len;
 }
 
 // ---------------------------------------------------------------- search
@@ -824,7 +979,7 @@ const TopK = struct {
 
 fn scanRange(snap: *const Snapshot, q: *const fuzzy.Query, filter: Filter, now: i64, start: usize, end: usize, top: *TopK) void {
     const filtered = filter.isActive();
-    for (snap.entries[start..end], start..) |e, i| {
+    for (snap.entries.items[start..end], start..) |e, i| {
         if (filtered and !filter.matches(snap.path(e), e)) continue;
         const s = fuzzy.score(q, snap.path(e), e.name_off, e.path_mask, e.name_mask, e.mtime, now);
         if (s != 0) top.insert(.{ .idx = @intCast(i), .score = s, .len = e.len });
@@ -843,7 +998,7 @@ pub fn searchFiltered(self: *Index, arena: Allocator, query: []const u8, filter:
     self.mem_mutex.lockUncancelable(self.io);
     defer self.mem_mutex.unlock(self.io);
     const snap = &self.snap;
-    const total = snap.entries.len;
+    const total = snap.entries.items.len;
 
     var top: TopK = .{ .k = k };
     const cpus = std.Thread.getCpuCount() catch 1;
@@ -875,7 +1030,7 @@ pub fn searchFiltered(self: *Index, arena: Allocator, query: []const u8, filter:
 
     const n = top.n;
     for (top.buf[0..n], 0..) |r, i| {
-        const e = snap.entries[r.idx];
+        const e = snap.entries.items[r.idx];
         out[i] = .{
             .path = try arena.dupeSentinel(u8, snap.path(e), 0),
             .name_off = e.name_off,
@@ -895,7 +1050,7 @@ pub fn sameSize(self: *Index, arena: Allocator, size: u64, out: []Hit) !usize {
     defer self.mem_mutex.unlock(self.io);
     const snap = &self.snap;
     var n: usize = 0;
-    for (snap.entries) |e| {
+    for (snap.entries.items) |e| {
         if (e.is_dir or e.size != size) continue;
         out[n] = .{
             .path = try arena.dupeSentinel(u8, snap.path(e), 0),
@@ -1033,10 +1188,11 @@ pub fn findDuplicates(
         self.mem_mutex.lockUncancelable(io);
         defer self.mem_mutex.unlock(io);
         const snap = &self.snap;
+        const entries = snap.entries.items;
         var order: std.ArrayList(u32) = .empty;
         defer order.deinit(gpa);
         const floor = @max(min_size, 1);
-        for (snap.entries, 0..) |e, i| {
+        for (entries, 0..) |e, i| {
             if (!e.is_dir and e.size >= floor) try order.append(gpa, @intCast(i));
         }
         const SizeOrder = struct {
@@ -1045,16 +1201,16 @@ pub fn findDuplicates(
                 return o.entries[a].size < o.entries[b].size;
             }
         };
-        std.sort.pdq(u32, order.items, SizeOrder{ .entries = snap.entries }, SizeOrder.less);
+        std.sort.pdq(u32, order.items, SizeOrder{ .entries = entries }, SizeOrder.less);
         var i: usize = 0;
         while (i < order.items.len) {
-            const size = snap.entries[order.items[i]].size;
+            const size = entries[order.items[i]].size;
             var j = i + 1;
-            while (j < order.items.len and snap.entries[order.items[j]].size == size) j += 1;
+            while (j < order.items.len and entries[order.items[j]].size == size) j += 1;
             if (j - i >= 2) {
                 for (order.items[i..j]) |k| {
                     try cands.append(arena, .{
-                        .path = try arena.dupeSentinel(u8, snap.path(snap.entries[k]), 0),
+                        .path = try arena.dupeSentinel(u8, snap.path(entries[k]), 0),
                         .size = size,
                     });
                 }
@@ -1790,6 +1946,185 @@ test "re-indexing is idempotent and picks up new and changed files" {
     try testing.expectEqual(@as(u64, 6), hits[0].size);
 }
 
+test "loading sizes the snapshot to fit, with nothing spare" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    for (0..300) |i| {
+        var buf: [48]u8 = undefined;
+        try fx.touch(try std.fmt.bufPrint(&buf, "sub/naïve-{d}.txt", .{i})); // bytes, not characters
+    }
+    {
+        const idx = try fx.open();
+        defer idx.close();
+        _ = try idx.indexRoot(fx.root(), null, null);
+    }
+    const idx = try fx.open();
+    defer idx.close();
+    try testing.expectEqual(@as(usize, 301), idx.snap.entries.items.len);
+    try testing.expectEqual(idx.snap.entries.items.len, idx.snap.entries.capacity);
+    try testing.expectEqual(idx.snap.buf.items.len, idx.snap.buf.capacity);
+}
+
+test "a rescan with nothing changed writes no rows" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.write("a.txt", "1");
+    try fx.write("sub/b.txt", "22");
+    const idx = try fx.open();
+    defer idx.close();
+    try testing.expectEqual(@as(u64, 3), try idx.indexRoot(fx.root(), null, null));
+    const before = idx.db.totalChanges();
+    try testing.expectEqual(@as(u64, 3), try idx.indexRoot(fx.root(), null, null));
+    try testing.expectEqual(before, idx.db.totalChanges());
+    try testing.expectEqual(@as(u64, 3), idx.fileCount());
+}
+
+test "a rescan writes only the rows that changed" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    for ([_][]const u8{ "keep1.txt", "keep2.txt", "keep3.txt", "edit.txt", "gone.txt" }) |f| try fx.write(f, "x");
+    const idx = try fx.open();
+    defer idx.close();
+    try setMtime(&fx, "edit.txt", 1_000);
+    _ = try idx.indexRoot(fx.root(), null, null);
+    const before = idx.db.totalChanges();
+    // Same modification time, different size: still a change.
+    try fx.write("edit.txt", "longer now");
+    try setMtime(&fx, "edit.txt", 1_000);
+    try fx.touch("new.txt");
+    try fx.tree.dir.deleteFile(testing.io, "gone.txt");
+    try testing.expectEqual(@as(u64, 5), try idx.indexRoot(fx.root(), null, null));
+    // One update, one insert, one delete.
+    try testing.expectEqual(before + 3, idx.db.totalChanges());
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var hits: [8]Hit = undefined;
+    try testing.expectEqual(@as(usize, 1), try idx.search(arena.allocator(), "edit.txt", 0, &hits));
+    try testing.expectEqual(@as(u64, 10), hits[0].size);
+    try testing.expectEqual(@as(usize, 1), try idx.search(arena.allocator(), "new.txt", 0, &hits));
+    try testing.expectEqual(@as(usize, 0), try idx.search(arena.allocator(), "gone.txt", 0, &hits));
+    try testing.expectEqual(@as(usize, 3), try idx.search(arena.allocator(), "keep", 0, &hits));
+}
+
+/// Every snapshot entry as "path|size|mtime|is_dir", sorted, so two snapshots can be compared.
+fn snapshotLines(idx: *Index, arena: Allocator) ![][]const u8 {
+    var lines: std.ArrayList([]const u8) = .empty;
+    for (idx.snap.entries.items) |e| {
+        const p = idx.snap.path(e);
+        try testing.expectEqual(@as(u8, 0), idx.snap.buf.items[e.off + e.len]);
+        try testing.expectEqual(fuzzy.charMask(p), e.path_mask);
+        try testing.expectEqual(fuzzy.charMask(p[e.name_off..]), e.name_mask);
+        try lines.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{d}|{}", .{ p, e.size, e.mtime, e.is_dir }));
+    }
+    const Less = struct {
+        fn f(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    };
+    std.mem.sort([]const u8, lines.items, {}, Less.f);
+    return lines.items;
+}
+
+fn expectSnapshotMatchesDatabase(idx: *Index) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const patched = try snapshotLines(idx, arena.allocator());
+    try idx.reload();
+    const loaded = try snapshotLines(idx, arena.allocator());
+    try testing.expectEqual(loaded.len, patched.len);
+    for (loaded, patched) |want, got| try testing.expectEqualStrings(want, got);
+}
+
+test "a snapshot patched by rescans is the one a fresh load would build" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    for (0..40) |i| {
+        var buf: [48]u8 = undefined;
+        try fx.write(try std.fmt.bufPrint(&buf, "d{d}/sub/file{d}.txt", .{ i % 5, i }), "abc");
+    }
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+    try expectSnapshotMatchesDatabase(idx);
+
+    // Edits, additions, a deleted folder, and a file that becomes a folder.
+    try fx.write("d0/sub/file0.txt", "a much longer body");
+    try fx.write("d1/brand/new.md", "n");
+    try fx.tree.dir.deleteTree(testing.io, "d2");
+    try fx.tree.dir.deleteFile(testing.io, "d3/sub/file3.txt");
+    try fx.write("d3/sub/file3.txt/inside.txt", "now a folder");
+    _ = try idx.indexRoot(fx.root(), null, null);
+    try expectSnapshotMatchesDatabase(idx);
+    var d2_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try testing.expectEqual(@as(u64, 0), idx.rootFileCount(try std.fmt.bufPrint(&d2_buf, "{s}/d2", .{fx.root()})));
+
+    // Everything goes.
+    for (0..5) |i| {
+        var buf: [8]u8 = undefined;
+        try fx.tree.dir.deleteTree(testing.io, try std.fmt.bufPrint(&buf, "d{d}", .{i}));
+    }
+    try testing.expectEqual(@as(u64, 0), try idx.indexRoot(fx.root(), null, null));
+    try testing.expectEqual(@as(u64, 0), idx.fileCount());
+    try expectSnapshotMatchesDatabase(idx);
+}
+
+test "removed entries give their path bytes back" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    for (0..200) |i| {
+        var buf: [48]u8 = undefined;
+        try fx.touch(try std.fmt.bufPrint(&buf, "bulk/a-rather-long-file-name-{d}.txt", .{i}));
+    }
+    try fx.touch("stays.txt");
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+    const full = idx.snap.buf.items.len;
+
+    try fx.tree.dir.deleteTree(testing.io, "bulk");
+    try testing.expectEqual(@as(u64, 1), try idx.indexRoot(fx.root(), null, null));
+    try testing.expectEqual(@as(usize, 0), idx.snap.dead_bytes);
+    try testing.expect(idx.snap.buf.items.len < full / 50);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var hits: [4]Hit = undefined;
+    try testing.expectEqual(@as(usize, 1), try idx.search(arena.allocator(), "stays", 0, &hits));
+    try testing.expect(std.mem.endsWith(u8, hits[0].path, "/stays.txt"));
+    try expectSnapshotMatchesDatabase(idx);
+}
+
+test "scanning one root leaves another root's entries and rows alone" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.write("one/a.txt", "1");
+    try fx.write("two/b.txt", "2");
+    const idx = try fx.open();
+    defer idx.close();
+    var one_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const one = try std.fmt.bufPrint(&one_buf, "{s}/one", .{fx.root()});
+    var two_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const two = try std.fmt.bufPrint(&two_buf, "{s}/two", .{fx.root()});
+    _ = try idx.indexRoot(one, null, null);
+    _ = try idx.indexRoot(two, null, null);
+
+    try fx.tree.dir.deleteFile(testing.io, "one/a.txt");
+    const before = idx.db.totalChanges();
+    _ = try idx.indexRoot(two, null, null); // one/a.txt is gone from disk, but `one` wasn't scanned
+    try testing.expectEqual(before, idx.db.totalChanges());
+    try testing.expectEqual(@as(u64, 1), idx.rootFileCount(one));
+    _ = try idx.indexRoot(one, null, null);
+    try testing.expectEqual(@as(u64, 0), idx.rootFileCount(one));
+    try testing.expectEqual(@as(u64, 1), idx.rootFileCount(two));
+    try expectSnapshotMatchesDatabase(idx);
+}
+
 test "reindexAll rescans every root and skips ones that have vanished" {
     var fx: Fixture = undefined;
     try fx.init();
@@ -1984,7 +2319,7 @@ test "the parallel search path agrees with the single-threaded one" {
     // Reference: rank the same snapshot on one thread and compare.
     const q = fuzzy.Query.parse("file4242.txt");
     var reference: TopK = .{ .k = max_hits };
-    scanRange(&idx.snap, &q, .{}, 0, 0, idx.snap.entries.len, &reference);
+    scanRange(&idx.snap, &q, .{}, 0, 0, idx.snap.entries.items.len, &reference);
     try testing.expectEqual(reference.n, n);
     for (hits[0..n], reference.buf[0..n]) |h, r| try testing.expectEqual(r.score, h.score);
 
@@ -2021,7 +2356,7 @@ test "a negative size in the database loads as zero" {
     defer idx.close();
     try idx.db.exec("INSERT INTO files(path, name, ext, size, mtime, is_dir, seen) VALUES('/neg', 'neg', '', -5, 0, 0, 1)");
     try idx.reload();
-    try testing.expectEqual(@as(u64, 0), idx.snap.entries[0].size);
+    try testing.expectEqual(@as(u64, 0), idx.snap.entries.items[0].size);
 }
 
 test "the home folder's Library is skipped, other folders named Library are not" {

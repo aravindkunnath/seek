@@ -27,8 +27,7 @@ rejected early), three characters, eight characters, and several words. Each gro
 query that matches nothing.
 
 "Idle memory" is the process's memory footprint (the figure Activity Monitor shows) after the
-searches. Straight after loading it reads far lower, because macOS does not charge for the
-snapshot's pages until they have been read.
+searches have run.
 
 The benchmark covers the core only. It does not measure the app's own memory or drawing time.
 
@@ -45,30 +44,43 @@ These are the starting point suggested in `architecture-fitness.md`. They live i
 
 ## Measured
 
-2026-11-16, Apple M4 Pro (12 cores), 24 GB, macOS 27.0.1, internal SSD, 1,000,000 entries.
+Apple M4 Pro (12 cores), 24 GB, macOS 27.0.1, internal SSD, 1,000,000 entries. Scan times vary
+by a second or two between runs.
 
-| What | Result | Budget |
-|---|---|---|
-| First scan | 10.5 to 11.5 s (about 90,000 entries/s) | none yet |
-| Rescan, nothing changed | 10.2 s, 1,000,000 rows written | **not met** (0 rows) |
-| Database size | 371 MB, plus an 8 MB write-ahead log | none yet |
-| Open and load | 0.25 s | none yet |
-| Search p50 / p99, 1 character | 2.8 ms / 3.5 ms | met |
-| Search p50 / p99, 3 characters | 5.6 ms / 9.7 ms | met |
-| Search p50 / p99, 8 characters | 2.4 ms / 5.5 ms | met |
-| Search p50 / p99, several words | 2.7 ms / 7.2 ms | met |
-| Idle memory | 182 MB | met, with 9% to spare |
-| Peak memory, scan process | 79 MB | none yet |
+| What | 2026-11-16, first measurement | 2026-11-16, incremental scans (#5) | Budget |
+|---|---|---|---|
+| First scan | 10.5 to 11.5 s | 8.7 to 9.8 s | none yet |
+| Rescan, nothing changed | 10.2 s, 1,000,000 rows written | 7.1 to 8.1 s, 0 rows written | 0 rows: **met** |
+| Database size | 371 MB | 354 MB | none yet |
+| Open and load | 0.25 s | 0.31 s | none yet |
+| Search p99, 1 character | 3.5 ms | 3.6 ms | met |
+| Search p99, 3 characters | 9.7 ms | 9.5 ms | met |
+| Search p99, 8 characters | 5.5 ms | 5.5 ms | met |
+| Search p99, several words | 7.2 ms | 7.3 ms | met |
+| Idle memory | 182 MB | 176 MB | met, with 12% to spare |
+| Peak memory, scan process | not comparable (see below) | 220 MB | none yet |
+
+The first measurement's scan process reported a 79 MB peak. That figure left out the snapshot:
+the old loader's last step moved the snapshot to a right-sized block, and macOS did not charge
+for those pages until something read them. The same effect made memory read 35 MB straight
+after loading. Loading now sizes the snapshot before filling it, so the numbers are real from
+the start.
+
+Seek.app itself, opened on this index and left alone after its launch rescan, holds 195 MB:
+the 176 MB snapshot plus about 19 MB of app.
 
 ## What the numbers say
 
 - Search is comfortably inside its budget on this machine. A slower Mac with fewer cores has
   not been measured.
-- A rescan costs as much as a first scan and rewrites every row. That is the cost the app pays
-  every 15 minutes today, and what incremental updates (R1 in `architecture-fitness.md`) are
-  meant to remove.
-- Idle memory is close to the limit. Paths in this tree average 132 bytes (35,000 of the entries
-  are folders, nested up to seven deep); a home folder with longer paths would go over. Storing a name and a parent instead of a full path (R2) is
-  the known way down.
-- The database is 371 MB for a million entries, about 370 bytes an entry, because each path is
-  stored in the table and again in its unique index.
+- A rescan that finds nothing changed now writes nothing and leaves the snapshot alone. What is
+  left of its 7 to 8 seconds is walking the tree and asking the file system about each entry,
+  which only a file watcher (#12) removes.
+- Idle memory is close to the limit. Paths in this tree average 132 bytes (35,000 of the
+  entries are folders, nested up to seven deep); a home folder with longer paths would go over.
+  Storing a name and a parent instead of a full path (R2 in `architecture-fitness.md`) is the
+  known way down.
+- A first scan leaves the snapshot's buffers up to half again larger than they need to be,
+  because they grow as entries arrive. Restarting sizes them exactly.
+- The database is about 350 bytes an entry, because each path is stored in the table and again
+  in its unique index.

@@ -5,6 +5,11 @@ const Index = @import("Index.zig");
 
 const gpa = std.heap.c_allocator;
 
+/// libseek runs on the host app's threads. Zig's default reserves a 256 KB alternate signal
+/// stack in thread-local storage for every thread that calls in, and installs it on threads
+/// the core starts; signal handling belongs to the host, so the core does neither.
+pub const std_options: std.Options = .{ .signal_stack_size = null };
+
 const Handle = struct {
     threaded: std.Io.Threaded,
     index: *Index,
