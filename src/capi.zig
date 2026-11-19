@@ -13,10 +13,19 @@ pub const std_options: std.Options = .{ .signal_stack_size = null };
 const Handle = struct {
     threaded: std.Io.Threaded,
     index: *Index,
-    results: std.heap.ArenaAllocator,
-    hits: [256]Index.Hit = undefined,
+    /// seek_search's results. The mutex makes overlapping searches take turns instead of
+    /// writing into each other's results.
+    search: ResultBuffer,
+    /// seek_find_same_size's results, separate so one call can't overwrite the other's.
+    same_size: ResultBuffer,
     /// Backing store for seek_last_error; only touched by the thread that calls it.
     last_error: [Index.error_message_max + 1]u8 = @splat(0),
+};
+
+const ResultBuffer = struct {
+    mutex: std.Io.Mutex = .init,
+    arena: std.heap.ArenaAllocator,
+    hits: [256]Index.Hit = undefined,
 };
 
 pub const SeekResult = extern struct {
@@ -42,8 +51,8 @@ export fn seek_open(db_path: ?[*:0]const u8) ?*anyopaque {
         Index.defaultDbPath(gpa, io) catch return fail(h);
     defer gpa.free(path);
     h.index = Index.open(gpa, io, path) catch return fail(h);
-    h.results = .init(gpa);
-    h.hits = undefined;
+    h.search = .{ .arena = .init(gpa) };
+    h.same_size = .{ .arena = .init(gpa) };
     return h;
 }
 
@@ -71,7 +80,8 @@ fn fail(h: *Handle) ?*anyopaque {
 export fn seek_close(p: ?*anyopaque) void {
     const h = handle(p orelse return);
     h.index.close();
-    h.results.deinit();
+    h.search.arena.deinit();
+    h.same_size.arena.deinit();
     h.threaded.deinit();
     gpa.destroy(h);
 }
@@ -136,8 +146,12 @@ export fn seek_search(p: *anyopaque, query: [*:0]const u8, out: [*]SeekResult, m
 export fn seek_search_filtered(p: *anyopaque, query: [*:0]const u8, filter: ?*const SeekFilter, out: [*]SeekResult, max: c_int) c_int {
     const h = handle(p);
     if (max <= 0) return 0;
-    _ = h.results.reset(.retain_capacity);
-    const want: usize = @min(@as(usize, @intCast(max)), h.hits.len);
+    const io = h.threaded.io();
+    const buf = &h.search;
+    buf.mutex.lockUncancelable(io);
+    defer buf.mutex.unlock(io);
+    _ = buf.arena.reset(.retain_capacity);
+    const want: usize = @min(@as(usize, @intCast(max)), buf.hits.len);
     const now: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(h.threaded.io(), .real).nanoseconds, std.time.ns_per_s));
     var f: Index.Filter = .{};
     if (filter) |sf| {
@@ -148,11 +162,11 @@ export fn seek_search_filtered(p: *anyopaque, query: [*:0]const u8, filter: ?*co
             .modified_after = sf.modified_after,
         };
     }
-    const n = h.index.searchFiltered(h.results.allocator(), std.mem.span(query), f, now, h.hits[0..want]) catch |err| {
+    const n = h.index.searchFiltered(buf.arena.allocator(), std.mem.span(query), f, now, buf.hits[0..want]) catch |err| {
         h.index.recordError("search", err);
         return 0;
     };
-    for (h.hits[0..n], 0..) |hit, i| {
+    for (buf.hits[0..n], 0..) |hit, i| {
         out[i] = .{
             .path = @ptrCast(hit.path.ptr),
             .name_offset = hit.name_off,
@@ -165,17 +179,21 @@ export fn seek_search_filtered(p: *anyopaque, query: [*:0]const u8, filter: ?*co
     return @intCast(n);
 }
 
-/// Files of exactly `size` bytes (duplicate candidates). Shares the result buffer with seek_search.
+/// Files of exactly `size` bytes (duplicate candidates). Has its own result buffer.
 export fn seek_find_same_size(p: *anyopaque, size: u64, out: [*]SeekResult, max: c_int) c_int {
     const h = handle(p);
     if (max <= 0) return 0;
-    _ = h.results.reset(.retain_capacity);
-    const want: usize = @min(@as(usize, @intCast(max)), h.hits.len);
-    const n = h.index.sameSize(h.results.allocator(), size, h.hits[0..want]) catch |err| {
+    const io = h.threaded.io();
+    const buf = &h.same_size;
+    buf.mutex.lockUncancelable(io);
+    defer buf.mutex.unlock(io);
+    _ = buf.arena.reset(.retain_capacity);
+    const want: usize = @min(@as(usize, @intCast(max)), buf.hits.len);
+    const n = h.index.sameSize(buf.arena.allocator(), size, buf.hits[0..want]) catch |err| {
         h.index.recordError("find same size", err);
         return 0;
     };
-    for (h.hits[0..n], 0..) |hit, i| {
+    for (buf.hits[0..n], 0..) |hit, i| {
         out[i] = .{
             .path = @ptrCast(hit.path.ptr),
             .name_offset = hit.name_off,
@@ -231,7 +249,7 @@ export fn seek_find_duplicates(
 
 pub const StrFn = *const fn (ctx: ?*anyopaque, s: [*:0]const u8, n: u64) callconv(.c) void;
 
-/// Calls `cb` once per saved folder with its path and indexed entry count. May wait for a running scan.
+/// Calls `cb` once per saved folder with its path and indexed entry count. Doesn't wait for a scan.
 export fn seek_list_roots(p: *anyopaque, cb: StrFn, ctx: ?*anyopaque) void {
     const idx = handle(p).index;
     const list = idx.roots(gpa) catch |err| return idx.recordError("list folders", err);
@@ -248,13 +266,23 @@ export fn seek_remove_root(p: *anyopaque, path: [*:0]const u8) c_int {
 }
 
 /// User exclusions: a name or `*` pattern (`*.log`, `build`), or an absolute folder path.
-/// Takes effect on the next scan.
+/// Adding one removes what it excludes from the index before returning (no scan needed); it
+/// waits for a running scan first.
 export fn seek_add_exclude(p: *anyopaque, pattern: [*:0]const u8) c_int {
     return status(handle(p), "add exclusion", handle(p).index.addExclude(std.mem.span(pattern)));
 }
 
 export fn seek_remove_exclude(p: *anyopaque, pattern: [*:0]const u8) c_int {
     return status(handle(p), "remove exclusion", handle(p).index.removeExclude(std.mem.span(pattern)));
+}
+
+/// After seek_remove_exclude: scans what is needed to bring back what `pattern` was hiding
+/// (one saved folder for an absolute path, all of them for a name pattern). Blocking.
+/// Returns entries seen, or -1 on error.
+export fn seek_rescan_for_exclude(p: *anyopaque, pattern: [*:0]const u8, progress: ?Index.ProgressFn, ctx: ?*anyopaque) i64 {
+    const h = handle(p);
+    const n = h.index.rescanForPattern(std.mem.span(pattern), progress, ctx) catch |err| return fail2(h, "rescan", err);
+    return @intCast(n);
 }
 
 export fn seek_list_excludes(p: *anyopaque, cb: StrFn, ctx: ?*anyopaque) void {

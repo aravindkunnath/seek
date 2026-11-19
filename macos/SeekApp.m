@@ -917,7 +917,7 @@ static const CGFloat kSettingsW = 760, kSettingsH = 540, kSide = 180, kPad = 24;
     [self statusChanged];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSMutableArray *roots = [NSMutableArray array], *ex = [NSMutableArray array];
-        seek_list_roots(idx, CollectString, (__bridge void *)roots); // may wait for a running scan
+        seek_list_roots(idx, CollectString, (__bridge void *)roots);
         seek_list_excludes(idx, CollectString, (__bridge void *)ex);
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_roots = roots;
@@ -2502,22 +2502,22 @@ static OSStatus OnHotKey(EventHandlerCallRef next, EventRef event, void *userDat
     }];
 }
 
-// Exclusions apply on the next scan, so changing one rescans right away.
+// Adding an exclusion drops what it excludes from the index at once: no scan.
 - (void)addExclude:(NSString *)pattern {
     const char *p = strdup(pattern.UTF8String);
     [self enqueueIndexJob:^(seek_index *idx, void *ctx) {
         seek_add_exclude(idx, p);
         free((void *)p);
-        seek_reindex_all(idx, OnIndexProgress, ctx);
     }];
 }
 
 - (void)removeExclude:(NSString *)pattern {
     const char *p = strdup(pattern.UTF8String);
     [self enqueueIndexJob:^(seek_index *idx, void *ctx) {
+        // Removing one has to look at the disk again, but only where the pattern could have applied.
         seek_remove_exclude(idx, p);
+        seek_rescan_for_exclude(idx, p, OnIndexProgress, ctx);
         free((void *)p);
-        seek_reindex_all(idx, OnIndexProgress, ctx);
     }];
 }
 

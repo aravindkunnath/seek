@@ -2,8 +2,14 @@
 //! of every path serves as-you-type filename search.
 //!
 //! Thread safety: `search` and `indexRoot` may run on different threads.
-//! Indexing is serialized by `db_mutex`. The snapshot is changed only while holding both
-//! `db_mutex` and `mem_mutex`, so it may be read while holding either one.
+//! Three locks, always taken in this order:
+//!   `scan_mutex`  one scan (or other change to which entries exist) at a time. Held for a whole
+//!                 scan, including the walk of the disk.
+//!   `db_mutex`    one database transaction at a time. Held briefly, never across a walk, so
+//!                 listing folders and exclusions doesn't wait for a scan.
+//!   `mem_mutex`   the snapshot's contents.
+//! The snapshot is changed only while holding all three, so it may be read while holding
+//! `scan_mutex` (a scan comparing the disk against it) or `mem_mutex` (a search).
 
 const std = @import("std");
 const Io = std.Io;
@@ -16,6 +22,7 @@ const Index = @This();
 gpa: Allocator,
 io: Io,
 db: sqlite.Db,
+scan_mutex: Io.Mutex = .init,
 db_mutex: Io.Mutex = .init,
 mem_mutex: Io.Mutex = .init,
 snap: Snapshot = .{},
@@ -527,6 +534,8 @@ pub fn freeRoots(gpa: Allocator, list: [][]u8) void {
 /// Removes a folder from the index: forgets it and drops every entry under it.
 pub fn removeRoot(self: *Index, root_in: []const u8) !void {
     const root = trimSlash(root_in);
+    self.scan_mutex.lockUncancelable(self.io);
+    defer self.scan_mutex.unlock(self.io);
     self.db_mutex.lockUncancelable(self.io);
     defer self.db_mutex.unlock(self.io);
     {
@@ -566,14 +575,78 @@ pub fn rootFileCount(self: *Index, root_in: []const u8) u64 {
 
 /// User exclusions: a name or `*` pattern matched against every file and folder name
 /// (`*.log`, `build`), or an absolute path that skips that folder.
-pub fn addExclude(self: *Index, pattern: []const u8) !void {
-    if (pattern.len == 0) return;
-    self.db_mutex.lockUncancelable(self.io);
-    defer self.db_mutex.unlock(self.io);
-    const st = try self.db.prepare("INSERT OR IGNORE INTO excludes(pattern) VALUES(?)");
-    defer st.finalize();
-    try st.bindText(1, if (pattern[0] == '/') trimSlash(pattern) else pattern);
-    _ = try st.step();
+/// Adding one takes effect at once: entries it excludes leave the index here, without a scan.
+/// Waits for a running scan to finish.
+pub fn addExclude(self: *Index, pattern_in: []const u8) !void {
+    if (pattern_in.len == 0) return;
+    const pattern = if (pattern_in[0] == '/') trimSlash(pattern_in) else pattern_in;
+    self.scan_mutex.lockUncancelable(self.io);
+    defer self.scan_mutex.unlock(self.io);
+    {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        const st = try self.db.prepare("INSERT OR IGNORE INTO excludes(pattern) VALUES(?)");
+        defer st.finalize();
+        try st.bindText(1, pattern);
+        _ = try st.step();
+    }
+    try self.pruneExcluded(pattern);
+}
+
+/// The saved folder that a scan would reach `p` from: the deepest one containing it. When
+/// saved folders nest, the inner one is scanned last, so its view of an entry is the one that stays.
+fn deepestRoot(root_list: []const []u8, p: []const u8) ?[]const u8 {
+    var best: ?[]const u8 = null;
+    for (root_list) |r| {
+        if (isUnder(r, p) and (best == null or r.len > best.?.len)) best = r;
+    }
+    return best;
+}
+
+/// Whether a scan would leave `p` out because of `pattern`: the same answer `userExcluded`
+/// gives during a walk, worked out from the path alone.
+fn excludedBy(pattern: []const u8, root_list: []const []u8, p: []const u8) bool {
+    const root = deepestRoot(root_list, p) orelse return false;
+    if (pattern[0] == '/') {
+        // A walk only meets the excluded folder if it lies below the folder being scanned.
+        return isUnder(root, pattern) and (std.mem.eql(u8, p, pattern) or isUnder(pattern, p));
+    }
+    // A name pattern hides an entry when it matches the entry or any folder between it and the root.
+    var names = std.mem.tokenizeScalar(u8, p[(if (std.mem.eql(u8, root, "/")) 0 else root.len)..], '/');
+    while (names.next()) |name| if (globMatch(pattern, name)) return true;
+    return false;
+}
+
+/// Removes every entry `pattern` excludes. Caller holds scan_mutex.
+fn pruneExcluded(self: *Index, pattern: []const u8) !void {
+    const root_list = try self.roots(self.gpa);
+    defer freeRoots(self.gpa, root_list);
+    const scratch = std.heap.page_allocator;
+    const snap = &self.snap;
+    var keep: std.DynamicBitSetUnmanaged = try .initFull(scratch, snap.entries.items.len);
+    defer keep.deinit(scratch);
+    for (snap.entries.items, 0..) |e, i| {
+        if (excludedBy(pattern, root_list, snap.path(e))) keep.unset(i);
+    }
+    const gone = keep.bit_length - keep.count();
+    try self.removeMissing(&keep);
+    if (gone > 0) self.logf("info", "excluding {s} removed {d} entries", .{ pattern, gone });
+}
+
+/// Brings back what a removed exclusion was hiding, scanning no more than it has to: for an
+/// absolute path, only the saved folder that contains it; for a name pattern, every saved
+/// folder. Call after `removeExclude`. Returns the number of entries seen.
+pub fn rescanForPattern(self: *Index, pattern_in: []const u8, progress: ?ProgressFn, ctx: ?*anyopaque) !u64 {
+    if (pattern_in.len == 0) return 0;
+    if (pattern_in[0] != '/') return self.reindexAll(progress, ctx);
+    const pattern = trimSlash(pattern_in);
+    const root_list = try self.roots(self.gpa);
+    defer freeRoots(self.gpa, root_list);
+    var best: ?[]const u8 = null;
+    for (root_list) |r| {
+        if (isUnder(r, pattern) and (best == null or r.len > best.?.len)) best = r;
+    }
+    return self.indexRoot(best orelse return 0, progress, ctx);
 }
 
 pub fn removeExclude(self: *Index, pattern: []const u8) !void {
@@ -684,11 +757,13 @@ const Changes = struct {
 };
 
 /// Writes `changes` to the database in one transaction, then makes the same changes to the
-/// snapshot, and empties the list. Caller holds db_mutex. If the database write fails the
+/// snapshot, and empties the list. Caller holds scan_mutex. If the database write fails the
 /// snapshot is left as it was. If the snapshot runs out of memory part-way it is missing
 /// entries the database has; the next scan sees them as new and puts them back.
 fn applyChanges(self: *Index, changes: *Changes) !void {
     if (changes.items.items.len == 0) return;
+    self.db_mutex.lockUncancelable(self.io);
+    defer self.db_mutex.unlock(self.io);
     const db = self.db;
     {
         const upsert = try db.prepare(
@@ -740,10 +815,12 @@ fn rollback(self: *Index) void {
 }
 
 /// Removes from the database and the snapshot every entry whose bit in `keep` is clear.
-/// `keep` covers the entries the snapshot had when the scan began. Caller holds db_mutex.
+/// `keep` covers the entries the snapshot had when the caller took scan_mutex, which it holds.
 fn removeMissing(self: *Index, keep: *const std.DynamicBitSetUnmanaged) !void {
     const missing = keep.bit_length - keep.count();
     if (missing == 0) return;
+    self.db_mutex.lockUncancelable(self.io);
+    defer self.db_mutex.unlock(self.io);
     const db = self.db;
     {
         const del = try db.prepare("DELETE FROM files WHERE path = ?");
@@ -786,13 +863,13 @@ pub fn indexRoot(self: *Index, root_in: []const u8, progress: ?ProgressFn, ctx: 
     var dir = try Io.Dir.openDirAbsolute(io, root, .{ .iterate = true });
     defer dir.close(io);
 
-    self.db_mutex.lockUncancelable(io);
-    defer self.db_mutex.unlock(io);
+    self.scan_mutex.lockUncancelable(io);
+    defer self.scan_mutex.unlock(io);
 
-    const user_ex = try self.excludesLocked(gpa);
+    const user_ex = try self.excludes(gpa);
     defer freeRoots(gpa, user_ex);
 
-    // What the index holds under this root now: path -> entry number. Holding db_mutex keeps
+    // What the index holds under this root now: path -> entry number. Holding scan_mutex keeps
     // the entries where they are until this scan itself removes some, which it does last.
     // Both lookups are sized once and come straight from the system, so the memory goes back
     // the moment the scan ends instead of sitting in the allocator's cache of freed blocks.
@@ -807,10 +884,24 @@ pub fn indexRoot(self: *Index, root_in: []const u8, progress: ?ProgressFn, ctx: 
     // A clear bit at the end of the walk means "under this root and not found on disk".
     var keep: std.DynamicBitSetUnmanaged = try .initEmpty(scratch, known_count);
     defer keep.deinit(scratch);
+    // Saved folders inside this one. What they hold is theirs to remove: this walk may not reach
+    // it (an exclusion can hide it from here but not from there), and that is not a deletion.
+    const root_list = try self.roots(gpa);
+    defer freeRoots(gpa, root_list);
+    var inner_roots: std.ArrayList([]const u8) = .empty;
+    defer inner_roots.deinit(gpa);
+    for (root_list) |r| if (isUnder(root, r)) try inner_roots.append(gpa, r);
     for (snap.entries.items, 0..) |e, i| {
-        if (isUnder(root, snap.path(e))) {
-            known.putAssumeCapacityContext(e.off, @intCast(i), by_offset);
-        } else keep.set(i);
+        const p = snap.path(e);
+        if (!isUnder(root, p)) {
+            keep.set(i);
+            continue;
+        }
+        known.putAssumeCapacityContext(e.off, @intCast(i), by_offset);
+        for (inner_roots.items) |r| if (isUnder(r, p)) {
+            keep.set(i);
+            break;
+        };
     }
 
     var changes: Changes = .{};
@@ -866,6 +957,8 @@ pub fn indexRoot(self: *Index, root_in: []const u8, progress: ?ProgressFn, ctx: 
     try self.applyChanges(&changes);
     try self.removeMissing(&keep);
     {
+        self.db_mutex.lockUncancelable(io);
+        defer self.db_mutex.unlock(io);
         const st = try self.db.prepare("INSERT OR IGNORE INTO roots(path) VALUES(?)");
         defer st.finalize();
         try st.bindText(1, root);
@@ -902,12 +995,14 @@ pub fn reindexAllCounting(self: *Index, progress: ?ProgressFn, ctx: ?*anyopaque,
 // ---------------------------------------------------------------- snapshot
 
 pub fn reload(self: *Index) !void {
+    self.scan_mutex.lockUncancelable(self.io);
+    defer self.scan_mutex.unlock(self.io);
     self.db_mutex.lockUncancelable(self.io);
     defer self.db_mutex.unlock(self.io);
     try self.reloadLocked();
 }
 
-/// Builds a fresh snapshot from SQLite and swaps it in. Caller holds db_mutex.
+/// Builds a fresh snapshot from SQLite and swaps it in. Caller holds scan_mutex and db_mutex.
 fn reloadLocked(self: *Index) !void {
     const gpa = self.gpa;
     var fresh: Snapshot = .{};
@@ -2123,6 +2218,178 @@ test "scanning one root leaves another root's entries and rows alone" {
     try testing.expectEqual(@as(u64, 0), idx.rootFileCount(one));
     try testing.expectEqual(@as(u64, 1), idx.rootFileCount(two));
     try expectSnapshotMatchesDatabase(idx);
+}
+
+const ListDuringScan = struct {
+    idx: *Index,
+    calls: u32 = 0,
+    listed: u32 = 0,
+
+    fn cb(ctx: ?*anyopaque, _: u64) callconv(.c) void {
+        const self: *ListDuringScan = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        // On the scanning thread itself: these would never return if the scan held the database lock.
+        const r = self.idx.roots(testing.allocator) catch return;
+        defer freeRoots(testing.allocator, r);
+        const ex = self.idx.excludes(testing.allocator) catch return;
+        defer freeRoots(testing.allocator, ex);
+        self.listed += 1;
+    }
+};
+
+test "folders and exclusions can be listed in the middle of a scan" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    for (0..5_200) |i| {
+        var buf: [32]u8 = undefined;
+        try fx.touch(try std.fmt.bufPrint(&buf, "d{d}/f{d}", .{ i % 20, i }));
+    }
+    const idx = try fx.open();
+    defer idx.close();
+    try idx.addExclude("*.tmp");
+    var probe: ListDuringScan = .{ .idx = idx };
+    _ = try idx.indexRoot(fx.root(), ListDuringScan.cb, &probe);
+    try testing.expect(probe.calls >= 2); // at 5,000 entries and at the end
+    try testing.expectEqual(probe.calls, probe.listed);
+}
+
+/// A rescan of everything that changes nothing proves the index already is what a scan would build.
+fn expectRescanChangesNothing(idx: *Index) !void {
+    const before = idx.db.totalChanges();
+    _ = try idx.reindexAll(null, null);
+    try testing.expectEqual(before, idx.db.totalChanges());
+}
+
+test "adding an exclusion removes what it excludes without a scan" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    for ([_][]const u8{ "a.log", "keep.txt", "build/x.txt", "deep/build/y.txt", "deep/builder.txt", "skip/inner/z.txt", "skipped.txt" }) |f| try fx.touch(f);
+    const idx = try fx.open();
+    defer idx.close();
+    try testing.expectEqual(@as(u64, 12), try idx.indexRoot(fx.root(), null, null));
+
+    try idx.addExclude("*.log");
+    try testing.expectEqual(@as(u64, 11), idx.fileCount());
+    try idx.addExclude("build"); // the folder, twice, and what is inside each
+    try testing.expectEqual(@as(u64, 7), idx.fileCount());
+    var skip_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try idx.addExclude(try std.fmt.bufPrint(&skip_buf, "{s}/skip/", .{fx.root()}));
+    try testing.expectEqual(@as(u64, 4), idx.fileCount()); // keep.txt, deep, deep/builder.txt, skipped.txt
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var hits: [8]Hit = undefined;
+    try testing.expectEqual(@as(usize, 0), try idx.search(arena.allocator(), "y.txt", 0, &hits));
+    try testing.expectEqual(@as(usize, 1), try idx.search(arena.allocator(), "builder", 0, &hits));
+    try testing.expectEqual(@as(usize, 1), try idx.search(arena.allocator(), "skipped", 0, &hits));
+    try expectSnapshotMatchesDatabase(idx);
+    try expectRescanChangesNothing(idx);
+}
+
+test "an exclusion that matches nothing, or is added twice, changes no entries" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.touch("a.txt");
+    const idx = try fx.open();
+    defer idx.close();
+    _ = try idx.indexRoot(fx.root(), null, null);
+    try idx.addExclude("*.nothing");
+    try idx.addExclude("/somewhere/else");
+    const before = idx.db.totalChanges();
+    try idx.addExclude("*.nothing");
+    try testing.expectEqual(before, idx.db.totalChanges());
+    try testing.expectEqual(@as(u64, 1), idx.fileCount());
+}
+
+test "a folder saved inside another saved folder keeps its entries across rescans" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.touch("outer/b/inside.txt");
+    try fx.touch("outer/b/gone.txt");
+    const idx = try fx.open();
+    defer idx.close();
+    var outer_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const outer = try std.fmt.bufPrint(&outer_buf, "{s}/outer", .{fx.root()});
+    var inner_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const inner = try std.fmt.bufPrint(&inner_buf, "{s}/outer/b", .{fx.root()});
+    _ = try idx.indexRoot(outer, null, null);
+    _ = try idx.indexRoot(inner, null, null);
+    try idx.addExclude("b"); // hides the folder from `outer`, not from itself
+    try expectRescanChangesNothing(idx);
+    try testing.expectEqual(@as(u64, 2), idx.rootFileCount(inner));
+
+    // A file deleted inside the inner folder is noticed by the inner folder's scan.
+    try fx.tree.dir.deleteFile(testing.io, "outer/b/gone.txt");
+    _ = try idx.indexRoot(outer, null, null);
+    try testing.expectEqual(@as(u64, 2), idx.rootFileCount(inner));
+    _ = try idx.indexRoot(inner, null, null);
+    try testing.expectEqual(@as(u64, 1), idx.rootFileCount(inner));
+}
+
+test "with nested folders, an exclusion is judged from the inner one, as a rescan would" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.touch("outer/b/inside.txt");
+    try fx.touch("outer/other/b/hidden.txt");
+    const idx = try fx.open();
+    defer idx.close();
+    var outer_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const outer = try std.fmt.bufPrint(&outer_buf, "{s}/outer", .{fx.root()});
+    var inner_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const inner = try std.fmt.bufPrint(&inner_buf, "{s}/outer/b", .{fx.root()});
+    _ = try idx.indexRoot(outer, null, null);
+    _ = try idx.indexRoot(inner, null, null);
+
+    try idx.addExclude("b");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var hits: [8]Hit = undefined;
+    // `outer/b` is a saved folder in its own right, so what is inside it stays.
+    try testing.expectEqual(@as(usize, 1), try idx.search(arena.allocator(), "inside.txt", 0, &hits));
+    try testing.expectEqual(@as(usize, 0), try idx.search(arena.allocator(), "hidden.txt", 0, &hits));
+    try expectRescanChangesNothing(idx);
+}
+
+test "removing an exclusion and rescanning for it brings the entries back" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    try fx.touch("one/cache/a.txt");
+    try fx.touch("two/b.txt");
+    const idx = try fx.open();
+    defer idx.close();
+    var one_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const one = try std.fmt.bufPrint(&one_buf, "{s}/one", .{fx.root()});
+    var two_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const two = try std.fmt.bufPrint(&two_buf, "{s}/two", .{fx.root()});
+    var cache_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cache = try std.fmt.bufPrint(&cache_buf, "{s}/one/cache", .{fx.root()});
+    _ = try idx.indexRoot(one, null, null);
+    _ = try idx.indexRoot(two, null, null);
+
+    try idx.addExclude(cache);
+    try testing.expectEqual(@as(u64, 0), idx.rootFileCount(one));
+
+    // An absolute path only needs the folder that contains it: `two` is not walked, so a file
+    // deleted there is still listed afterwards.
+    try fx.tree.dir.deleteFile(testing.io, "two/b.txt");
+    try idx.removeExclude(cache);
+    try testing.expectEqual(@as(u64, 2), try idx.rescanForPattern(cache, null, null));
+    try testing.expectEqual(@as(u64, 2), idx.rootFileCount(one));
+    try testing.expectEqual(@as(u64, 1), idx.rootFileCount(two));
+
+    // A name pattern can hide things anywhere, so every folder is walked.
+    try idx.addExclude("cache");
+    try idx.removeExclude("cache");
+    try testing.expectEqual(@as(u64, 2), try idx.rescanForPattern("cache", null, null));
+    try testing.expectEqual(@as(u64, 0), idx.rootFileCount(two));
+    try testing.expectEqual(@as(u64, 0), try idx.rescanForPattern("/nowhere/near", null, null));
+    try testing.expectEqual(@as(u64, 0), try idx.rescanForPattern("", null, null));
 }
 
 test "reindexAll rescans every root and skips ones that have vanished" {

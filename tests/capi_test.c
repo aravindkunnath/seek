@@ -76,10 +76,26 @@ int main(int argc, char **argv) {
 
     CHECK(seek_search(idx, "index", res, 16) >= 1);
     uint64_t index_size = res[0].size;
-    k = seek_find_same_size(idx, index_size, res, 16);
+    char first_path[PATH_MAX];
+    snprintf(first_path, sizeof first_path, "%s", res[0].path);
+    seek_result same[16];
+    k = seek_find_same_size(idx, index_size, same, 16);
     CHECK(k >= 1);
-    for (int i = 0; i < k; i++) CHECK(res[i].size == index_size && !res[i].is_dir);
-    CHECK(seek_find_same_size(idx, 0, res, 16) == 0);
+    for (int i = 0; i < k; i++) CHECK(same[i].size == index_size && !same[i].is_dir);
+    CHECK(seek_find_same_size(idx, 0, same, 16) == 0);
+    /* The search results are still intact: the two calls don't share a buffer. */
+    CHECK(strcmp(res[0].path, first_path) == 0);
+    CHECK(strcmp(res[0].path + res[0].name_offset, "Index.zig") == 0);
+
+    /* An exclusion takes effect at once, without a scan; removing it needs the matching rescan. */
+    CHECK(seek_add_exclude(idx, "Index.zig") == 0);
+    CHECK(seek_file_count(idx) == (uint64_t)n - 1);
+    k = seek_search(idx, "Index.zig", res, 16);
+    for (int i = 0; i < k; i++) CHECK(strcmp(res[i].path + res[i].name_offset, "Index.zig") != 0);
+    CHECK(seek_remove_exclude(idx, "Index.zig") == 0);
+    CHECK(seek_file_count(idx) == (uint64_t)n - 1);
+    CHECK(seek_rescan_for_exclude(idx, "Index.zig", on_progress, NULL) == n);
+    CHECK(seek_file_count(idx) == (uint64_t)n);
 
     /* Duplicates: two copies of one file, two of another, a same-size odd one out, an empty pair. */
     char dd[64];
