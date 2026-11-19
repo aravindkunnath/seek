@@ -1,5 +1,5 @@
 //! Minimal SQLite bindings. Declared by hand (no C headers needed), which keeps
-//! builds fast and avoids translate-c. Links against the system libsqlite3.
+//! builds fast and avoids translate-c. Links against the SQLite bundled in vendor/sqlite.
 
 const std = @import("std");
 
@@ -31,6 +31,7 @@ extern "c" fn sqlite3_column_bytes(stmt: *c_stmt, col: c_int) c_int;
 extern "c" fn sqlite3_libversion() [*:0]const u8;
 extern "c" fn sqlite3_libversion_number() c_int;
 extern "c" fn sqlite3_errmsg(db: *c_db) [*:0]const u8;
+extern "c" fn sqlite3_total_changes64(db: *c_db) i64;
 
 /// `DatabaseCorrupt` means the file is damaged or isn't a database at all (SQLITE_CORRUPT,
 /// SQLITE_NOTADB); every other failure is `SqliteError`.
@@ -101,6 +102,12 @@ pub const Db = struct {
         var buf: [48]u8 = undefined;
         const sql = std.fmt.bufPrintSentinel(&buf, "PRAGMA user_version = {d}", .{v}, 0) catch return error.SqliteError;
         try db.exec(sql);
+    }
+
+    /// Rows inserted, updated or deleted through this connection since it was opened.
+    /// The difference across an operation is how many rows that operation wrote.
+    pub fn totalChanges(db: Db) i64 {
+        return sqlite3_total_changes64(db.handle);
     }
 
     pub fn errmsg(db: Db) []const u8 {
@@ -201,6 +208,21 @@ test "bad SQL and constraint violations are errors, not crashes" {
     st.reset();
     try st.bindText(1, "same");
     try std.testing.expectError(error.SqliteError, st.step());
+}
+
+test "totalChanges counts rows written, including updates that change nothing" {
+    const db = try Db.open(":memory:");
+    defer db.close();
+    try std.testing.expectEqual(@as(i64, 0), db.totalChanges());
+    try db.exec("CREATE TABLE t(k INTEGER PRIMARY KEY, v INTEGER)");
+    try db.exec("INSERT INTO t VALUES(1, 1), (2, 2)");
+    try std.testing.expectEqual(@as(i64, 2), db.totalChanges());
+    try db.exec("UPDATE t SET v = v");
+    try std.testing.expectEqual(@as(i64, 4), db.totalChanges());
+    const st = try db.prepare("SELECT v FROM t");
+    defer st.finalize();
+    while (try st.step()) {}
+    try std.testing.expectEqual(@as(i64, 4), db.totalChanges());
 }
 
 test "user_version starts at 0 and round-trips" {

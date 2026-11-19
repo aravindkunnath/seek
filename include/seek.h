@@ -55,7 +55,10 @@ const char *seek_log_path(seek_index *idx);
 uint64_t seek_file_count(seek_index *idx);
 
 /* Ranked filename search. Writes up to max results into out and returns the count.
- * Safe to call while indexing runs on another thread; call from one search thread at a time. */
+ * Safe to call while indexing runs on another thread. The path in each result points into a
+ * buffer the index owns, valid until the next seek_search or seek_search_filtered call on this
+ * handle: copy what you keep before then. Searches from several threads take turns, but each
+ * one invalidates the previous one's paths, so search from one thread at a time. */
 int seek_search(seek_index *idx, const char *query, seek_result *out, int max);
 
 /* Narrows a search; zero in every field means no filtering. */
@@ -70,7 +73,8 @@ typedef struct {
 int seek_search_filtered(seek_index *idx, const char *query, const seek_filter *filter, seek_result *out, int max);
 
 /* Files of exactly `size` bytes: duplicate candidates, to be confirmed by comparing content.
- * Shares its result buffer with seek_search (call from the same thread). */
+ * Result paths are valid until the next seek_find_same_size call on this handle. They do not
+ * share a buffer with seek_search: neither call disturbs the other's results. */
 int seek_find_same_size(seek_index *idx, uint64_t size, seek_result *out, int max);
 
 /* Duplicate detection. Finds files with identical content (compared by SHA-256, so a match is
@@ -91,12 +95,21 @@ int64_t seek_find_duplicates(seek_index *idx, uint64_t min_size, seek_dup_progre
                              seek_dup_group_fn on_group, void *ctx);
 
 /* Folder and exclusion management. The list functions call cb once per item (n = entry count for
- * folders, 0 otherwise) and may block while a scan runs: call them from a background thread. */
+ * folders, 0 otherwise). They read the database, so keep them off the main thread, but they do
+ * not wait for a running scan.
+ * seek_remove_root and seek_add_exclude do wait for a running scan: call them from a background
+ * thread, and never from a progress callback.
+ * seek_add_exclude takes effect before it returns: entries the pattern excludes leave the index,
+ * with no scan. seek_remove_exclude only forgets the pattern; follow it with
+ * seek_rescan_for_exclude, which scans just enough to bring back what the pattern was hiding
+ * (the one saved folder containing an absolute path; every saved folder for a name pattern).
+ * It blocks like seek_index_root and returns entries seen, or -1 on error. */
 typedef void (*seek_str_fn)(void *ctx, const char *s, uint64_t n);
 void seek_list_roots(seek_index *idx, seek_str_fn cb, void *ctx);
 int seek_remove_root(seek_index *idx, const char *abs_path);          /* forgets the folder and its entries */
 int seek_add_exclude(seek_index *idx, const char *pattern);           /* name, "*" pattern, or absolute path */
 int seek_remove_exclude(seek_index *idx, const char *pattern);
+int64_t seek_rescan_for_exclude(seek_index *idx, const char *pattern, seek_progress_fn progress, void *ctx);
 void seek_list_excludes(seek_index *idx, seek_str_fn cb, void *ctx);
 void seek_list_default_excludes(seek_str_fn cb, void *ctx);           /* built-in, not editable */
 
